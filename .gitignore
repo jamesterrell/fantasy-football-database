@@ -1,0 +1,12 @@
+# Raw API archive and generated database - reproducible via `python -m ffdb add`
+data/raw/
+data/exports/
+*.db
+*.db-wal
+*.db-shm
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
