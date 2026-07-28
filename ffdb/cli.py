@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from . import athletes as athletes_mod
-from . import config, db, pipeline
+from . import config, db, pipeline, ranking, scoring
 from .espn import ESPNClient
 
 
@@ -112,6 +112,56 @@ def cmd_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_build_top(args: argparse.Namespace) -> int:
+    conn = db.connect(args.db)
+    db.init_db(conn)
+    result = ranking.build_top_n(
+        conn, _client(args), season=args.season, top=args.top,
+        scoring_format=args.scoring, force=args.force,
+    )
+    pool = result["pool"]
+    print(
+        f"\ncandidate pool {pool['pool']} | {pool['loaded']} with {args.season} games | "
+        f"{len(pool['empty'])} without | {len(pool['failed'])} failed"
+    )
+    print(
+        f"ranked top {result['ranked']} by {args.scoring}; "
+        f"backfilled {result['backfill']['games']} career games "
+        f"for {result['backfill']['players']} players"
+    )
+    conn.close()
+    return 0
+
+
+def cmd_rankings(args: argparse.Namespace) -> int:
+    conn = db.connect(args.db)
+    db.init_db(conn)
+    rows = conn.execute(
+        "SELECT rank, display_name, position_rank, team_abbr, games, points_total, "
+        "points_per_game FROM v_rankings WHERE season = ? AND scoring = ? "
+        "ORDER BY rank LIMIT ?",
+        (args.season, args.scoring, args.top),
+    ).fetchall()
+    if not rows:
+        print(
+            f"No {args.scoring} rankings for {args.season}. Run:  "
+            f"python -m ffdb build-top --season {args.season}",
+            file=sys.stderr,
+        )
+        return 1
+    header = f"{'#':>4}  {'PLAYER':<26}{'POS':<6}{'TEAM':<6}{'GMS':>4}{'PTS':>9}{'PTS/G':>8}"
+    print(header)
+    print("-" * len(header))
+    for r in rows:
+        print(
+            f"{r['rank']:>4}  {r['display_name'] or '?':<26}{r['position_rank'] or '':<6}"
+            f"{r['team_abbr'] or '':<6}{r['games']:>4}{r['points_total']:>9}"
+            f"{r['points_per_game']:>8}"
+        )
+    conn.close()
+    return 0
+
+
 def cmd_index(args: argparse.Namespace) -> int:
     client = _client(args)
     index = athletes_mod.fetch_athlete_index(client, force=args.force)
@@ -153,6 +203,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_export.add_argument("--table", default="v_player_games")
     p_export.add_argument("--out")
     p_export.set_defaults(func=cmd_export)
+
+    p_top = sub.add_parser(
+        "build-top", help="derive the top N players from a season, then load their careers"
+    )
+    p_top.add_argument("--season", type=int, required=True, help="season to rank on")
+    p_top.add_argument("--top", type=int, default=200)
+    p_top.add_argument("--scoring", default=ranking.DEFAULT_SCORING, choices=sorted(scoring.FORMATS))
+    p_top.add_argument("--force", action="store_true")
+    p_top.set_defaults(func=cmd_build_top)
+
+    p_rank = sub.add_parser("rankings", help="show a stored ranking")
+    p_rank.add_argument("--season", type=int, required=True)
+    p_rank.add_argument("--top", type=int, default=50)
+    p_rank.add_argument("--scoring", default=ranking.DEFAULT_SCORING, choices=sorted(scoring.FORMATS))
+    p_rank.set_defaults(func=cmd_rankings)
 
     p_index = sub.add_parser("index", help="refresh/search ESPN's athlete index")
     p_index.add_argument("--search", help="look up ids for a name")
