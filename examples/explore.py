@@ -35,31 +35,32 @@ def main():
     # ------------------------------------------------------------------ 2
     # v_player_games is the one to use for modelling: it has the player's name
     # and position joined on, and Pro Bowls already filtered out.
-    print("\n=== 2. Ten most recent games")
+    print("\n=== 2. One player's ten most recent games")
     print(q(conn, """
         SELECT game_date, week, opponent_abbr, home_away, result, receivingYards, receivingTouchdowns,
                rushingAttempts, rushingYards, rushingTouchdowns, receptions, fp_ppr
         FROM v_player_games
+        WHERE display_name = :player
         ORDER BY game_date DESC
         LIMIT 10
-    """).to_string(index=False))
+    """, player="Jonathan Taylor").to_string(index=False))
 
     # ------------------------------------------------------------------ 3
     # WHERE filters rows, ORDER BY sorts, LIMIT caps the count.
-    print("\n=== 3. Best PPR games of his career (regular season only)")
+    print("\n=== 3. Biggest single games in the database (regular season)")
     print(q(conn, """
-        SELECT season, week, opponent_abbr, rushingYards, rushingTouchdowns,
-               receptions, receivingYards, fp_ppr
+        SELECT display_name, position_abbr, season, week, opponent_abbr,
+               rushingYards, receivingYards, receptions, fp_ppr
         FROM v_player_games
         WHERE season_type = 2
         ORDER BY fp_ppr DESC
-        LIMIT 5
+        LIMIT 10
     """).to_string(index=False))
 
     # ------------------------------------------------------------------ 4
     # GROUP BY collapses rows into one row per group; the aggregate functions
     # (SUM/AVG/COUNT/MAX) describe each group.
-    print("\n=== 4. Per-season totals (this is what GROUP BY is for)")
+    print("\n=== 4. One player's season totals (this is what GROUP BY is for)")
     print(q(conn, """
         SELECT season,
                COUNT(*)                        AS games,
@@ -69,46 +70,56 @@ def main():
                ROUND(SUM(fp_ppr), 1)           AS ppr_total,
                ROUND(AVG(fp_ppr), 1)           AS ppr_per_game
         FROM v_player_games
-        WHERE season_type = 2
+        WHERE display_name = :player AND season_type = 2
         GROUP BY season
         ORDER BY season
-    """).to_string(index=False))
+    """, player="Jonathan Taylor").to_string(index=False))
 
     # ------------------------------------------------------------------ 5
-    print("\n=== 5. Home vs away splits")
+    # HAVING filters *after* grouping - use it on aggregates, WHERE on raw rows.
+    print("\n=== 5. Most consistent RBs: best average PPR, min 10 games in 2025")
     print(q(conn, """
-        SELECT home_away,
+        SELECT display_name,
                COUNT(*)              AS games,
                ROUND(AVG(fp_ppr), 1) AS avg_ppr,
-               ROUND(AVG(rushingYards), 1) AS avg_rush_yds
+               ROUND(MAX(fp_ppr), 1) AS best_game
         FROM v_player_games
-        WHERE season_type = 2
-        GROUP BY home_away
+        WHERE season = 2025 AND season_type = 2 AND position_abbr = 'RB'
+        GROUP BY athlete_id
+        HAVING games >= 10
+        ORDER BY avg_ppr DESC
+        LIMIT 10
     """).to_string(index=False))
 
     # ------------------------------------------------------------------ 6
-    # Named parameters (:season) keep values out of the SQL string.
-    print("\n=== 6. Parameterised query - one season")
+    # The derived ranking, with position rank (RB1, WR1, ...) alongside.
+    print("\n=== 6. Top 15 of the 2025 PPR ranking")
     print(q(conn, """
-        SELECT week, opponent_abbr, result, rushingYards, fp_ppr
-        FROM v_player_games
-        WHERE season = :season AND season_type = 2
-        ORDER BY week
-    """, season=2025).head().to_string(index=False))
+        SELECT rank, display_name, position_rank, team_abbr, games,
+               points_total, points_per_game
+        FROM v_rankings
+        WHERE season = :season AND scoring = 'ppr'
+        ORDER BY rank
+        LIMIT 15
+    """, season=2025).to_string(index=False))
 
     # ------------------------------------------------------------------ 7
     # Once it's a DataFrame, use pandas for anything SQL makes awkward -
-    # rolling windows, shifts, and other modelling features.
-    print("\n=== 7. Hand off to pandas: 3-game rolling average")
+    # rolling windows, shifts, and other modelling features. groupby() keeps
+    # each player's history separate so one player's form can't leak into
+    # the next player's rows.
+    print("\n=== 7. Hand off to pandas: per-player rolling form and a target")
     df = q(conn, """
-        SELECT game_date, season, week, opponent_abbr, fp_ppr
+        SELECT athlete_id, display_name, game_date, season, week, fp_ppr
         FROM v_player_games
         WHERE season_type = 2
-        ORDER BY game_date
+        ORDER BY athlete_id, game_date
     """)
-    df["fp_ppr_roll3"] = df["fp_ppr"].rolling(3).mean().round(1)
-    df["fp_ppr_next"] = df["fp_ppr"].shift(-1)   # a plausible model target
-    print(df.tail(8).to_string(index=False))
+    grouped = df.groupby("athlete_id")["fp_ppr"]
+    df["fp_ppr_roll3"] = grouped.transform(lambda s: s.rolling(3).mean()).round(1)
+    df["fp_ppr_next"] = grouped.shift(-1)   # a plausible model target
+    print(df[df.display_name == "Jonathan Taylor"].tail(6).to_string(index=False))
+    print(f"\n({len(df):,} player-games across {df.athlete_id.nunique()} players)")
 
     # ------------------------------------------------------------------ 8
     # Every stat ESPN sent is also kept verbatim as JSON per game, so you can

@@ -113,6 +113,29 @@ CREATE TABLE IF NOT EXISTS stat_catalog (
     first_seen  TEXT
 );
 
+CREATE TABLE IF NOT EXISTS teams (
+    team_id      TEXT PRIMARY KEY,
+    abbreviation TEXT,
+    display_name TEXT,
+    location     TEXT,
+    name         TEXT
+);
+
+-- Derived rankings: who the top N were by actual production in a season.
+CREATE TABLE IF NOT EXISTS rankings (
+    season          INTEGER NOT NULL,
+    scoring         TEXT    NOT NULL,
+    athlete_id      TEXT    NOT NULL REFERENCES athletes(athlete_id),
+    rank            INTEGER NOT NULL,
+    position_rank   INTEGER,
+    position_abbr   TEXT,
+    games           INTEGER,
+    points_total    REAL,
+    points_per_game REAL,
+    computed_at     TEXT,
+    PRIMARY KEY (season, scoring, athlete_id)
+);
+
 CREATE TABLE IF NOT EXISTS sync_log (
     athlete_id TEXT NOT NULL,
     season     INTEGER NOT NULL,
@@ -121,6 +144,7 @@ CREATE TABLE IF NOT EXISTS sync_log (
     PRIMARY KEY (athlete_id, season)
 );
 
+CREATE INDEX IF NOT EXISTS ix_rankings_season ON rankings(season, scoring, rank);
 CREATE INDEX IF NOT EXISTS ix_player_games_season ON player_games(season, season_type);
 CREATE INDEX IF NOT EXISTS ix_player_games_athlete ON player_games(athlete_id, game_date);
 CREATE INDEX IF NOT EXISTS ix_games_season ON games(season, week);
@@ -241,6 +265,28 @@ def upsert_player_games(conn: sqlite3.Connection, rows: Iterable[dict]) -> int:
     return count
 
 
+def upsert_teams(conn: sqlite3.Connection, teams: Iterable[dict]) -> int:
+    count = 0
+    for team in teams:
+        _upsert(conn, "teams", dict(team), ("team_id",))
+        count += 1
+    conn.commit()
+    return count
+
+
+def replace_rankings(conn: sqlite3.Connection, season: int, scoring: str, rows: Iterable[dict]) -> int:
+    """Swap in a fresh ranking for one season/format."""
+    conn.execute("DELETE FROM rankings WHERE season = ? AND scoring = ?", (season, scoring))
+    count = 0
+    for row in rows:
+        record = dict(row)
+        record["computed_at"] = now_iso()
+        _upsert(conn, "rankings", record, ("season", "scoring", "athlete_id"))
+        count += 1
+    conn.commit()
+    return count
+
+
 def record_sync(conn: sqlite3.Connection, athlete_id: str, season: int, games: int) -> None:
     _upsert(
         conn,
@@ -280,6 +326,17 @@ VIEWS = {
         JOIN athletes a ON a.athlete_id = pg.athlete_id
         WHERE pg.is_all_star = 0
         GROUP BY pg.athlete_id, pg.season, pg.season_type
+    """,
+    "v_rankings": """
+        CREATE VIEW v_rankings AS
+        SELECT r.season, r.scoring, r.rank,
+               a.display_name,
+               r.position_abbr,
+               r.position_abbr || r.position_rank AS position_rank,
+               a.team_abbr,
+               r.games, r.points_total, r.points_per_game
+        FROM rankings r
+        JOIN athletes a ON a.athlete_id = r.athlete_id
     """,
 }
 

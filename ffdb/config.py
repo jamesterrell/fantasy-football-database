@@ -21,6 +21,10 @@ GAMELOG_URL = (
 # players), but site search still finds them.
 SEARCH_URL = "https://site.web.api.espn.com/apis/search/v2"
 
+# Rosters, used to assemble the candidate pool for ranking.
+TEAMS_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams"
+ROSTER_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/{team_id}/roster"
+
 # The index endpoint caps page size at 1000 regardless of the limit you ask for.
 INDEX_PAGE_SIZE = 1000
 

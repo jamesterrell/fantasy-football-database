@@ -18,14 +18,19 @@ def build_player(
     name_or_id: str,
     seasons: Iterable[int] | None = None,
     force: bool = False,
+    profile: dict | None = None,
 ) -> dict:
     """Load one player's full career of game logs.
 
     `force=True` bypasses the raw JSON archive and re-fetches from ESPN, which
-    is what you want for the in-progress season.
+    is what you want for the in-progress season. Pass `profile` when the caller
+    already has the athlete's details (a roster load does) to skip two requests.
     """
-    athlete_id = athletes.resolve_athlete_id(client, name_or_id, force=force)
-    profile = athletes.fetch_profile(client, athlete_id, force=force)
+    if profile is None:
+        athlete_id = athletes.resolve_athlete_id(client, name_or_id, force=force)
+        profile = athletes.fetch_profile(client, athlete_id, force=force)
+    else:
+        athlete_id = profile["athlete_id"]
     db.upsert_athlete(conn, profile)
 
     name = profile.get("display_name") or athlete_id

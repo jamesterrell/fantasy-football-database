@@ -13,7 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ffdb import athletes, db, gamelog, scoring  # noqa: E402
+from ffdb import athletes, db, gamelog, ranking, rosters, scoring  # noqa: E402
 
 
 def make_payload() -> dict:
@@ -249,6 +249,134 @@ class TestDatabase(unittest.TestCase):
     def test_colliding_stat_name_is_prefixed(self):
         self.assertEqual(db.column_for_stat("week"), "stat_week")
         self.assertEqual(db.column_for_stat("rushingYards"), "rushingYards")
+
+
+class TestRosterParsing(unittest.TestCase):
+    def test_roster_entry_becomes_athlete_row(self):
+        athlete = {
+            "id": "4242335",
+            "firstName": "Jonathan",
+            "lastName": "Taylor",
+            "displayName": "Jonathan Taylor",
+            "weight": 226.0,
+            "height": 70.0,
+            "dateOfBirth": "1999-01-19T08:00Z",
+            "birthPlace": {"city": "Salem", "state": "NJ", "country": "USA"},
+            "experience": {"years": 7},
+            "jersey": "28",
+            "position": {"abbreviation": "RB", "displayName": "Running Back"},
+            "status": {"name": "Active", "type": "active"},
+        }
+        team = {"team_id": "11", "abbreviation": "IND"}
+        row = rosters._profile_from_roster(athlete, team)
+
+        self.assertEqual(row["athlete_id"], "4242335")
+        self.assertEqual(row["position_abbr"], "RB")
+        self.assertEqual(row["team_abbr"], "IND")
+        self.assertEqual(row["height_inches"], 70)
+        self.assertEqual(row["birth_date"], "1999-01-19")
+        self.assertEqual(row["active"], 1)
+
+    def test_shape_matches_athletes_table(self):
+        # A roster row is inserted straight into `athletes`, so every key it
+        # produces has to be a real column.
+        row = rosters._profile_from_roster(
+            {"id": "1", "position": {}, "status": {}}, {"team_id": "11"}
+        )
+        conn = db.connect(":memory:")
+        db.init_db(conn)
+        self.assertTrue(set(row) <= db.existing_columns(conn, "athletes"))
+        db.upsert_athlete(conn, row)  # must not raise
+        conn.close()
+
+    def test_inactive_status(self):
+        row = rosters._profile_from_roster(
+            {"id": "1", "position": {}, "status": {"name": "Injured Reserve", "type": "injured"}},
+            {"team_id": "11"},
+        )
+        self.assertEqual(row["active"], 0)
+
+
+class TestRanking(unittest.TestCase):
+    def setUp(self) -> None:
+        self.conn = db.connect(":memory:")
+        db.init_db(self.conn)
+        # Three players: a big scorer, a mid scorer, and one whose points come
+        # from a Pro Bowl and the postseason (neither should count).
+        players = [
+            ("1", "Big Scorer", "RB"),
+            ("2", "Mid Scorer", "WR"),
+            ("3", "Exhibition Only", "TE"),
+        ]
+        for athlete_id, name, position in players:
+            db.upsert_athlete(
+                self.conn,
+                {"athlete_id": athlete_id, "display_name": name, "position_abbr": position},
+            )
+
+        rows = [
+            self._game("1", "g1", 2, 0, 30.0),
+            self._game("1", "g2", 2, 0, 20.0),
+            self._game("2", "g3", 2, 0, 15.0),
+            self._game("3", "g4", 3, 1, 99.0),   # Pro Bowl
+            self._game("3", "g5", 3, 0, 40.0),   # postseason
+        ]
+        db.upsert_games(
+            self.conn, [{"event_id": r["event_id"], "season": 2025} for r in rows]
+        )
+        db.upsert_player_games(self.conn, rows)
+        db.rebuild_views(self.conn)
+
+    def tearDown(self) -> None:
+        self.conn.close()
+
+    @staticmethod
+    def _game(athlete_id, event_id, season_type, all_star, points):
+        return {
+            "athlete_id": athlete_id,
+            "event_id": event_id,
+            "season": 2025,
+            "season_type": season_type,
+            "is_all_star": all_star,
+            "fp_ppr": points,
+            "fp_half_ppr": points,
+            "fp_standard": points,
+            "_stats": {"rushingYards": points},
+        }
+
+    def test_ranks_by_regular_season_points(self):
+        ranked = ranking.compute_rankings(self.conn, 2025, top=10)
+        self.assertEqual([r["athlete_id"] for r in ranked], ["1", "2"])
+        self.assertEqual(ranked[0]["rank"], 1)
+        self.assertEqual(ranked[0]["points_total"], 50.0)
+        self.assertEqual(ranked[0]["points_per_game"], 25.0)
+
+    def test_postseason_and_pro_bowl_excluded(self):
+        # Player 3 has 139 points, all of it postseason/exhibition -> unranked.
+        ranked = ranking.compute_rankings(self.conn, 2025, top=10)
+        self.assertNotIn("3", [r["athlete_id"] for r in ranked])
+
+    def test_position_rank_counts_per_position(self):
+        ranked = ranking.compute_rankings(self.conn, 2025, top=10)
+        self.assertEqual((ranked[0]["position_abbr"], ranked[0]["position_rank"]), ("RB", 1))
+        self.assertEqual((ranked[1]["position_abbr"], ranked[1]["position_rank"]), ("WR", 1))
+
+    def test_top_n_truncates(self):
+        self.assertEqual(len(ranking.compute_rankings(self.conn, 2025, top=1)), 1)
+
+    def test_rankings_are_replaced_not_appended(self):
+        ranking.compute_rankings(self.conn, 2025, top=10)
+        ranking.compute_rankings(self.conn, 2025, top=10)
+        count = self.conn.execute("SELECT COUNT(*) FROM rankings").fetchone()[0]
+        self.assertEqual(count, 2)
+
+    def test_unknown_scoring_format_rejected(self):
+        with self.assertRaises(ValueError):
+            ranking.compute_rankings(self.conn, 2025, scoring_format="superflex")
+
+    def test_ranked_ids_round_trip(self):
+        ranking.compute_rankings(self.conn, 2025, top=10)
+        self.assertEqual(ranking.ranked_athlete_ids(self.conn, 2025), ["1", "2"])
 
 
 if __name__ == "__main__":
