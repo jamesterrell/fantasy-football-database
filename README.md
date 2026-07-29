@@ -30,10 +30,12 @@ Other commands:
 ```bash
 python -m ffdb build-top --season 2025 --top 200  # derive the top 200 and load their careers
 python -m ffdb rankings --season 2025 --top 50    # show a stored ranking
+python -m ffdb defense --season 2024              # team defense game logs, all 32 teams
+python -m ffdb defense --season 2024 --team KC    # just one team's schedule
 python -m ffdb add "Josh Allen" "Ja'Marr Chase"   # batch; one failure won't abort the run
 python -m ffdb add 4242335 --season 2025 --force  # by id, one season, bypass the cache
 python -m ffdb index --search "Justin Tucker"     # look up ESPN athlete ids
-python -m unittest discover -s tests              # 31 tests, no network needed
+python -m unittest discover -s tests              # 48 tests, no network needed
 ```
 
 `--force` re-fetches from ESPN instead of reading the local archive. Use it for the
@@ -130,13 +132,16 @@ Regular season is `season_type = 2`, postseason is `3`.
 | `teams` | the 32 NFL teams |
 | `games` | one row per NFL game seen: season, week, date, both teams, final score |
 | `player_games` | **the modelling table** - one row per player per game |
+| `team_defense_games` | one row per team per game: what that defense did and gave up |
 | `rankings` | derived top-N by season and scoring format, with position rank |
-| `stat_catalog` | every stat key seen, and the column it maps to |
+| `stat_catalog` | every stat key seen, which table it lives on, and its column |
 | `sync_log` | what was loaded when, per athlete-season |
 
 Views (rebuilt on every load): `v_player_games` adds player name/position and
 excludes exhibition games; `v_player_seasons` aggregates fantasy points per season;
-`v_rankings` is the ranking with names and teams joined on.
+`v_rankings` is the ranking with names and teams joined on; `v_team_defense` adds
+team names; `v_player_games_vs_defense` attaches the opposing defense to every
+player-game.
 
 **Stat columns are dynamic.** ESPN publishes a different stat vocabulary per
 position — a QB log has `passingYards` and `QBRating`, a RB log has
@@ -149,6 +154,48 @@ Fantasy points are computed at load time into `fp_standard`, `fp_half_ppr` and
 `fp_ppr`, so the table ships with a ready target variable. Verified against known
 totals — Taylor's 2021 is 373.1 PPR (1811 rush yds, 18 rush TD, 40 rec, 360 rec
 yds, 2 rec TD, 2 fumbles lost).
+
+## Team defense
+
+`python -m ffdb defense --season 2024` loads a full season of team defensive game
+logs — 32 teams × 17 games = 544 rows, two per game. Add `--postseason` for playoff
+games, or `--team KC` to follow one schedule.
+
+Two endpoints feed it: the team schedule supplies the season's events and final
+scores, and a per-competitor statistics endpoint supplies each team's full stat
+line for one event. Both competitors are read together, because **a defense's
+"allowed" numbers are just the opposing offense's own numbers** — `yards_allowed`
+on the Chiefs' row is the Ravens' `totalYards` from the same game.
+
+Columns come in three groups:
+
+| group | examples | source |
+|---|---|---|
+| matchup | `season`, `week`, `opponent_id`, `home_away`, `result` | team schedule |
+| allowed | `points_allowed`, `yards_allowed`, `pass_yards_allowed`, `third_down_conv_allowed`, `turnovers_forced` | the opposing offense's line |
+| the defense's own | `sacks`, `interceptions`, `totalTackles`, `QBHits`, `passesDefended` | ESPN's `defensive` categories, dynamic columns |
+
+`points_allowed` is derived from the final score rather than read from ESPN's own
+`defensive.pointsAllowed`, which is zero-filled before roughly 2015 and disagrees
+with the opponent's total in some later games. ESPN's version is still stored, as
+the `pointsAllowed` / `yardsAllowed` columns, if you want to compare.
+
+Joining a defense onto a player-game is `event_id` plus the player's `opponent_id`:
+
+```sql
+SELECT pg.display_name, pg.week, pg.rushingYards, td.points_allowed, td.sacks
+FROM v_player_games pg
+JOIN team_defense_games td
+  ON td.event_id = pg.event_id AND td.team_id = pg.opponent_id
+WHERE pg.season = 2024;
+```
+
+`v_player_games_vs_defense` has that join built in.
+
+> **Careful with this as a feature.** These are the defense's numbers *in that same
+> game*, so `points_allowed` includes the points the player's own team just scored.
+> Using it directly as a model input leaks the outcome. For opponent strength, build
+> a season-to-date or trailing-N average that excludes the current game.
 
 ## Data quality notes
 
@@ -164,6 +211,11 @@ Things that were found the hard way and are handled in code:
   per-event rows with totals/by-opponent rollups. Only `type == "event"` is parsed.
 - **`interceptions` is position-dependent.** It means picks *thrown* on a QB log and
   picks *caught* on a defender's. The -2 only applies to players who threw a pass.
+- **`sacks` means opposite things in two tables.** Taken on a QB game log, recorded
+  on a team defense row. `stat_catalog` is keyed by `(table_name, stat_name)` so both
+  meanings coexist.
+- **Unplayed games carry no box score.** Schedule entries without a final score are
+  dropped rather than stored as empty rows, so an in-progress season loads cleanly.
 
 Known upstream limitations, not worked around:
 
@@ -185,4 +237,8 @@ Known upstream limitations, not worked around:
   tested against QB/RB/WR logs.
 - Derive modelling features (rolling averages, rest days, opponent strength) from
   `player_games`; the `game_date`/`opponent_id` columns exist for exactly this.
+  Opponent strength now has `team_defense_games` behind it — build it as a trailing
+  average so it doesn't leak the current game.
 - Add snap counts / target share, which need a different ESPN endpoint.
+- Score team defenses as a fantasy position (DST), which needs a points-allowed tier
+  table on top of the sacks/turnovers/TD columns already loaded.

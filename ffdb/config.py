@@ -25,6 +25,16 @@ SEARCH_URL = "https://site.web.api.espn.com/apis/search/v2"
 TEAMS_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams"
 ROSTER_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/{team_id}/roster"
 
+# Team defense. The schedule supplies the season's events; the per-competitor
+# statistics endpoint supplies one team's full stat line for one of them.
+TEAM_SCHEDULE_URL = (
+    "https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/{team_id}/schedule"
+)
+COMPETITOR_STATS_URL = (
+    "https://sports.core.api.espn.com/v2/sports/football/leagues/nfl/events/{event_id}"
+    "/competitions/{event_id}/competitors/{team_id}/statistics"
+)
+
 # The index endpoint caps page size at 1000 regardless of the limit you ask for.
 INDEX_PAGE_SIZE = 1000
 
