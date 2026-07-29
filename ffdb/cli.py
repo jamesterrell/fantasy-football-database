@@ -162,6 +162,50 @@ def cmd_rankings(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_defense(args: argparse.Namespace) -> int:
+    conn = db.connect(args.db)
+    db.init_db(conn)
+    season_types = [config.SEASON_TYPE_REGULAR]
+    if args.postseason:
+        season_types.append(config.SEASON_TYPE_POST)
+
+    result = pipeline.build_team_defense(
+        conn, _client(args), season=args.season,
+        season_types=season_types, teams=args.team, force=args.force,
+    )
+    print(
+        f"{result['season']}: {result['rows']} team-game rows from "
+        f"{result['events']} events across {result['teams']} teams"
+        + (f" ({len(result['skipped'])} without a box score)" if result["skipped"] else "")
+    )
+
+    rows = conn.execute(
+        """
+        SELECT team_abbr, COUNT(*) AS games,
+               ROUND(AVG(points_allowed), 1) AS pa,
+               ROUND(AVG(yards_allowed), 1)  AS ya,
+               SUM(sacks)            AS sacks,
+               SUM(turnovers_forced) AS tos
+        FROM team_defense_games
+        WHERE season = ? AND season_type = ? AND is_all_star = 0
+        GROUP BY team_id
+        ORDER BY pa
+        """,
+        (args.season, config.SEASON_TYPE_REGULAR),
+    ).fetchall()
+    if rows:
+        header = f"{'TEAM':<6}{'GMS':>4}{'PA/G':>8}{'YDS/G':>8}{'SACKS':>7}{'TO':>5}"
+        print("\n" + header)
+        print("-" * len(header))
+        for r in rows:
+            print(
+                f"{r['team_abbr'] or '?':<6}{r['games']:>4}{r['pa']:>8}"
+                f"{r['ya']:>8}{r['sacks'] or 0:>7}{r['tos'] or 0:>5}"
+            )
+    conn.close()
+    return 0
+
+
 def cmd_index(args: argparse.Namespace) -> int:
     client = _client(args)
     index = athletes_mod.fetch_athlete_index(client, force=args.force)
@@ -218,6 +262,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_rank.add_argument("--top", type=int, default=50)
     p_rank.add_argument("--scoring", default=ranking.DEFAULT_SCORING, choices=sorted(scoring.FORMATS))
     p_rank.set_defaults(func=cmd_rankings)
+
+    p_def = sub.add_parser("defense", help="load team defense game logs for a season")
+    p_def.add_argument("--season", type=int, required=True)
+    p_def.add_argument(
+        "--team", action="append", help="limit to team abbreviation(s), e.g. --team KC"
+    )
+    p_def.add_argument("--postseason", action="store_true", help="include playoff games")
+    p_def.add_argument("--force", action="store_true", help="re-fetch instead of using the archive")
+    p_def.set_defaults(func=cmd_defense)
 
     p_index = sub.add_parser("index", help="refresh/search ESPN's athlete index")
     p_index.add_argument("--search", help="look up ids for a name")

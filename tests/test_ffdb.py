@@ -13,7 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ffdb import athletes, db, gamelog, ranking, rosters, scoring  # noqa: E402
+from ffdb import athletes, db, gamelog, ranking, rosters, scoring, teamdefense  # noqa: E402
 
 
 def make_payload() -> dict:
@@ -377,6 +377,272 @@ class TestRanking(unittest.TestCase):
     def test_ranked_ids_round_trip(self):
         ranking.compute_rankings(self.conn, 2025, top=10)
         self.assertEqual(ranking.ranked_athlete_ids(self.conn, 2025), ["1", "2"])
+
+
+def make_schedule_payload() -> dict:
+    """One played game and one that has not kicked off yet."""
+    return {
+        "events": [
+            {
+                "id": "401671789",
+                "date": "2024-09-06T00:40Z",
+                "shortName": "BAL @ KC",
+                "season": {"year": 2024},
+                "seasonType": {"type": 2, "name": "Regular Season"},
+                "week": {"number": 1},
+                "competitions": [
+                    {
+                        "id": "401671789",
+                        "competitors": [
+                            {
+                                "id": "12",
+                                "homeAway": "home",
+                                "score": {"value": 27.0},
+                                "team": {"id": "12", "abbreviation": "KC"},
+                            },
+                            {
+                                "id": "33",
+                                "homeAway": "away",
+                                "score": {"value": 20.0},
+                                "team": {"id": "33", "abbreviation": "BAL"},
+                            },
+                        ],
+                    }
+                ],
+            },
+            {
+                "id": "999",
+                "date": "2024-09-15T17:00Z",
+                "season": {"year": 2024},
+                "seasonType": {"type": 2, "name": "Regular Season"},
+                "week": {"number": 2},
+                "competitions": [
+                    {
+                        "id": "999",
+                        "competitors": [
+                            {"id": "12", "homeAway": "away", "team": {"id": "12"}},
+                            {"id": "3", "homeAway": "home", "team": {"id": "3"}},
+                        ],
+                    }
+                ],
+            },
+        ]
+    }
+
+
+def make_competitor_stats(**overrides) -> dict:
+    """A statistics payload in the core API's category/stat shape."""
+    categories = {
+        "defensive": {"sacks": 1.0, "totalTackles": 60.0, "pointsAllowed": 0.0},
+        "defensiveInterceptions": {"interceptions": 0.0, "interceptionYards": 0.0},
+        "passing": {"totalYards": 353.0, "netPassingYards": 281.0},
+        "rushing": {"rushingYards": 72.0},
+        "scoring": {"passingTouchdowns": 3.0, "rushingTouchdowns": 1.0},
+        "miscellaneous": {"totalPlays": 60.0, "firstDowns": 20.0, "totalGiveaways": 1.0},
+        "returning": {"fumbleRecoveries": 1.0},
+    }
+    for category, stats in overrides.items():
+        categories.setdefault(category, {}).update(stats)
+    return {
+        "splits": {
+            "categories": [
+                {
+                    "name": name,
+                    "stats": [{"name": k, "value": v} for k, v in stats.items()],
+                }
+                for name, stats in categories.items()
+            ]
+        }
+    }
+
+
+class TestScheduleParsing(unittest.TestCase):
+    def setUp(self) -> None:
+        self.matchups = teamdefense.parse_schedule(make_schedule_payload())
+
+    def test_unplayed_games_dropped(self):
+        # The week 2 event has no score, so there are no stats to store.
+        self.assertEqual([m["event_id"] for m in self.matchups], ["401671789"])
+
+    def test_home_and_away_identified(self):
+        m = self.matchups[0]
+        self.assertEqual(m["home"]["team_abbr"], "KC")
+        self.assertEqual(m["away"]["team_abbr"], "BAL")
+        self.assertEqual((m["season"], m["week"], m["season_type"]), (2024, 1, 2))
+
+    def test_game_row_matches_games_table(self):
+        row = teamdefense.game_row(self.matchups[0])
+        conn = db.connect(":memory:")
+        db.init_db(conn)
+        self.assertTrue(set(row) <= db.existing_columns(conn, "games"))
+        db.upsert_games(conn, [row])  # must not raise
+        conn.close()
+
+
+class TestTeamDefenseParsing(unittest.TestCase):
+    def setUp(self) -> None:
+        self.matchup = teamdefense.parse_schedule(make_schedule_payload())[0]
+        self.kc = teamdefense.parse_competitor_stats(make_competitor_stats())
+        self.bal = teamdefense.parse_competitor_stats(
+            make_competitor_stats(
+                defensive={"sacks": 2.0, "totalTackles": 55.0},
+                defensiveInterceptions={"interceptions": 1.0},
+                passing={"totalYards": 452.0, "netPassingYards": 267.0},
+                rushing={"rushingYards": 185.0},
+                miscellaneous={"totalGiveaways": 1.0},
+                returning={"fumbleRecoveries": 0.0},
+            )
+        )
+
+    def _kc_row(self) -> dict:
+        return teamdefense.build_defense_row(
+            self.matchup, self.matchup["home"], self.matchup["away"], self.kc, self.bal
+        )
+
+    def test_points_allowed_is_the_opponents_score(self):
+        row = self._kc_row()
+        self.assertEqual(row["points_allowed"], 20.0)
+        self.assertEqual(row["team_score"], 27.0)
+        self.assertEqual(row["result"], "W")
+
+    def test_allowed_columns_come_from_the_opposing_offense(self):
+        row = self._kc_row()
+        self.assertEqual(row["yards_allowed"], 452.0)
+        self.assertEqual(row["pass_yards_allowed"], 267.0)
+        self.assertEqual(row["rush_yards_allowed"], 185.0)
+
+    def test_espn_zero_filled_allowed_stats_are_not_trusted(self):
+        # `defensive.pointsAllowed` is 0 in the payload for older seasons; the
+        # derived column has to come from the score instead.
+        row = self._kc_row()
+        self.assertEqual(row["_stats"]["pointsAllowed"], 0.0)
+        self.assertEqual(row["points_allowed"], 20.0)
+
+    def test_own_defensive_stats_kept(self):
+        row = self._kc_row()
+        self.assertEqual(row["_stats"]["sacks"], 1.0)
+        self.assertEqual(row["_stats"]["totalTackles"], 60.0)
+
+    def test_takeaways_read_from_the_defenses_own_line(self):
+        row = self._kc_row()
+        self.assertEqual(row["fumbles_recovered"], 1.0)
+        self.assertEqual(row["turnovers_forced"], 1.0)  # opponent giveaways
+
+    def test_both_sides_are_mirror_images(self):
+        kc = self._kc_row()
+        bal = teamdefense.build_defense_row(
+            self.matchup, self.matchup["away"], self.matchup["home"], self.bal, self.kc
+        )
+        self.assertEqual(bal["points_allowed"], kc["team_score"])
+        self.assertEqual(kc["points_allowed"], bal["team_score"])
+        self.assertEqual(bal["yards_allowed"], 353.0)
+        self.assertEqual(bal["result"], "L")
+        self.assertEqual(bal["home_away"], "away")
+
+    def test_missing_payload_yields_no_categories(self):
+        self.assertEqual(teamdefense.parse_competitor_stats(None), {})
+
+
+class TestTeamDefenseStorage(unittest.TestCase):
+    def setUp(self) -> None:
+        self.conn = db.connect(":memory:")
+        db.init_db(self.conn)
+        self.matchup = teamdefense.parse_schedule(make_schedule_payload())[0]
+        db.upsert_teams(
+            self.conn,
+            [
+                {"team_id": "12", "abbreviation": "KC", "display_name": "Kansas City Chiefs"},
+                {"team_id": "33", "abbreviation": "BAL", "display_name": "Baltimore Ravens"},
+            ],
+        )
+        db.upsert_games(self.conn, [teamdefense.game_row(self.matchup)])
+
+    def tearDown(self) -> None:
+        self.conn.close()
+
+    def _rows(self) -> list[dict]:
+        kc = teamdefense.parse_competitor_stats(make_competitor_stats())
+        bal = teamdefense.parse_competitor_stats(
+            make_competitor_stats(passing={"totalYards": 452.0})
+        )
+        return [
+            teamdefense.build_defense_row(
+                self.matchup, self.matchup["home"], self.matchup["away"], kc, bal
+            ),
+            teamdefense.build_defense_row(
+                self.matchup, self.matchup["away"], self.matchup["home"], bal, kc
+            ),
+        ]
+
+    def test_two_rows_per_game(self):
+        self.assertEqual(db.upsert_team_defense_games(self.conn, self._rows()), 2)
+        count = self.conn.execute("SELECT COUNT(*) FROM team_defense_games").fetchone()[0]
+        self.assertEqual(count, 2)
+
+    def test_reload_is_idempotent(self):
+        db.upsert_team_defense_games(self.conn, self._rows())
+        db.upsert_team_defense_games(self.conn, self._rows())
+        count = self.conn.execute("SELECT COUNT(*) FROM team_defense_games").fetchone()[0]
+        self.assertEqual(count, 2)
+
+    def test_defensive_stat_columns_created(self):
+        db.upsert_team_defense_games(self.conn, self._rows())
+        columns = db.existing_columns(self.conn, "team_defense_games")
+        self.assertIn("sacks", columns)
+        self.assertIn("totalTackles", columns)
+
+    def test_stat_catalog_separates_the_two_tables(self):
+        # `sacks` is taken on a QB game log and given up on a defense; the two
+        # meanings have to coexist in the catalog.
+        db.upsert_team_defense_games(self.conn, self._rows())
+        db.upsert_athlete(self.conn, {"athlete_id": "1", "display_name": "A QB"})
+        db.upsert_player_games(
+            self.conn,
+            [{"athlete_id": "1", "event_id": "401671789", "_stats": {"sacks": 3.0}}],
+        )
+        tables = [
+            r["table_name"]
+            for r in self.conn.execute(
+                "SELECT table_name FROM stat_catalog WHERE stat_name = 'sacks' ORDER BY table_name"
+            )
+        ]
+        self.assertEqual(tables, ["player_games", "team_defense_games"])
+
+    def test_baseline_columns_exist_before_any_load(self):
+        # v_player_games_vs_defense names these; SQLite would only fail at
+        # query time if they were missing.
+        columns = db.existing_columns(self.conn, "team_defense_games")
+        self.assertTrue(set(db.TEAM_DEFENSE_BASELINE_STATS) <= columns)
+
+    def test_views_are_queryable_on_an_empty_database(self):
+        db.rebuild_views(self.conn)
+        for view in ("v_team_defense", "v_player_games_vs_defense"):
+            self.conn.execute(f"SELECT * FROM {view} LIMIT 1").fetchall()
+
+    def test_defense_joins_onto_a_player_game(self):
+        db.upsert_team_defense_games(self.conn, self._rows())
+        db.upsert_athlete(self.conn, {"athlete_id": "1", "display_name": "A Back"})
+        db.upsert_player_games(
+            self.conn,
+            [
+                {
+                    "athlete_id": "1",
+                    "event_id": "401671789",
+                    "season": 2024,
+                    "team_id": "12",
+                    "opponent_id": "33",
+                    "is_all_star": 0,
+                    "_stats": {"rushingYards": 100.0},
+                }
+            ],
+        )
+        db.rebuild_views(self.conn)
+        row = self.conn.execute(
+            "SELECT def_points_allowed, def_sacks FROM v_player_games_vs_defense"
+        ).fetchone()
+        # The back faced BAL, so the defensive line attached is BAL's.
+        self.assertEqual(row["def_points_allowed"], 27.0)
+        self.assertEqual(row["def_sacks"], 1.0)
 
 
 if __name__ == "__main__":

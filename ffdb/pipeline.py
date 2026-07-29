@@ -6,7 +6,7 @@ import logging
 import sqlite3
 from collections.abc import Iterable
 
-from . import athletes, db, gamelog, scoring
+from . import athletes, config, db, gamelog, rosters, scoring, teamdefense
 from .espn import ESPNClient
 
 log = logging.getLogger(__name__)
@@ -106,3 +106,69 @@ def build_players(
             log.error("failed to load %s: %s", name, exc)
             failures.append((name, str(exc)))
     return summaries, failures
+
+
+def build_team_defense(
+    conn: sqlite3.Connection,
+    client: ESPNClient,
+    season: int,
+    season_types: Iterable[int] = (config.SEASON_TYPE_REGULAR,),
+    teams: Iterable[str] | None = None,
+    force: bool = False,
+) -> dict:
+    """Load every team's defensive game log for one season.
+
+    Each event is fetched once even though two teams' schedules list it, and
+    both competitors' stat lines are read together - a defense's allowed
+    numbers are the opposing offense's own numbers.
+    """
+    all_teams = rosters.fetch_teams(client, force=force)
+    db.upsert_teams(conn, all_teams)
+
+    wanted = {t.upper() for t in teams} if teams else None
+    selected = [
+        t
+        for t in all_teams
+        if wanted is None
+        or (t["abbreviation"] or "").upper() in wanted
+        or t["team_id"] in wanted
+    ]
+    if wanted and not selected:
+        raise ValueError(f"no NFL team matched {sorted(wanted)}")
+
+    # event_id -> matchup, deduped across the schedules that mention it.
+    matchups: dict[str, dict] = {}
+    for team in selected:
+        for season_type in season_types:
+            payload = teamdefense.fetch_schedule(
+                client, team["team_id"], season, season_type, force=force
+            )
+            for matchup in teamdefense.parse_schedule(payload):
+                matchups.setdefault(matchup["event_id"], matchup)
+
+    log.info("%s: %d events across %d teams", season, len(matchups), len(selected))
+
+    db.upsert_games(conn, [teamdefense.game_row(m) for m in matchups.values()])
+
+    rows: list[dict] = []
+    skipped: list[str] = []
+    for matchup in matchups.values():
+        event_rows = teamdefense.build_event_rows(client, matchup, force=force)
+        if not event_rows:
+            skipped.append(matchup["event_id"])
+            continue
+        rows.extend(event_rows)
+
+    loaded = db.upsert_team_defense_games(conn, rows)
+    db.rebuild_views(conn)
+
+    if skipped:
+        log.warning("%d events had no box score: %s", len(skipped), ", ".join(skipped[:10]))
+
+    return {
+        "season": season,
+        "teams": len(selected),
+        "events": len(matchups),
+        "rows": loaded,
+        "skipped": skipped,
+    }
