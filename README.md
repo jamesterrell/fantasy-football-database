@@ -36,7 +36,7 @@ python -m ffdb schedule --season 2026             # a season's matchups, upcomin
 python -m ffdb add "Josh Allen" "Ja'Marr Chase"   # batch; one failure won't abort the run
 python -m ffdb add 4242335 --season 2025 --force  # by id, one season, bypass the cache
 python -m ffdb index --search "Justin Tucker"     # look up ESPN athlete ids
-python -m unittest discover -s tests              # 58 tests, no network needed
+python -m unittest discover -s tests              # 63 tests, no network needed
 ```
 
 `--force` re-fetches from ESPN instead of reading the local archive. Use it for the
@@ -143,7 +143,8 @@ excludes exhibition games; `v_player_seasons` aggregates fantasy points per seas
 `v_rankings` is the ranking with names and teams joined on; `v_team_defense` adds
 team names; `v_player_games_vs_defense` attaches the opposing defense to every
 player-game; `v_team_schedule` is every regular-season game from both teams' points
-of view, one row per team per week.
+of view, one row per team per week; `v_team_defense_seasons` is one row per team per
+season of per-game defensive averages.
 
 **Stat columns are dynamic.** ESPN publishes a different stat vocabulary per
 position — a QB log has `passingYards` and `QBRating`, a RB log has
@@ -198,6 +199,44 @@ WHERE pg.season = 2024;
 > game*, so `points_allowed` includes the points the player's own team just scored.
 > Using it directly as a model input leaks the outcome. For opponent strength, build
 > a season-to-date or trailing-N average that excludes the current game.
+
+### Season averages
+
+`v_team_defense_seasons` collapses that table to one row per team per season — 192
+rows for 2020-2025, 32 teams each:
+
+```sql
+SELECT team_abbr, games, points_allowed_pg, yards_allowed_pg, sacks_pg,
+       turnovers_forced_pg, third_down_pct_allowed
+FROM v_team_defense_seasons
+WHERE season = 2025 ORDER BY points_allowed_pg;
+```
+
+Every stat column is a **per-game average** (`_pg` suffix), not a season total, so
+2020's 16-game season compares directly with the 17-game seasons after it; multiply
+by `games` for a total. `third_down_pct_allowed` is summed then divided rather than
+averaged per game, because the mean of per-game percentages weights a 1-for-2 game
+the same as a 6-for-12.
+
+Regular season only, and 2026 cannot appear — a row exists in `team_defense_games`
+only once ESPN publishes a box score, so unplayed games are absent by construction.
+Check `games` before trusting a season still in progress.
+
+**Two stats are deliberately left out.** ESPN zero-fills them rather than omitting
+them, and a `0` averages in as a real low where a `NULL` would be skipped:
+
+| stat | how bad | left out because |
+|---|---|---|
+| `redzone_tds_allowed` | `0.0` in all 3,230 rows, every season | a red-zone TD rate built on it reads as a real 0% for all 32 teams |
+| `plays_allowed` | `0` in 446 of 2020's 512 games | averaging the zeros puts 2020 near 8 plays per game; skipping them leaves ~2 games per team backing the number |
+
+Both remain on `team_defense_games` if you want to handle them yourself.
+`redzone_att_allowed_pg` is unaffected and stays — red-zone trips faced are real, it
+is only what happened inside the 20 that is missing.
+
+> The same leakage warning applies here in a subtler form: a full-season average
+> includes the games you are predicting. For a backward-looking feature, build a
+> season-to-date average from `team_defense_games` instead.
 
 ## Schedule and upcoming games
 
@@ -261,6 +300,11 @@ Things that were found the hard way and are handled in code:
 - **`sacks` means opposite things in two tables.** Taken on a QB game log, recorded
   on a team defense row. `stat_catalog` is keyed by `(table_name, stat_name)` so both
   meanings coexist.
+- **Some ESPN stats are zero-filled rather than absent.** `redzoneTouchdowns` is `0.0`
+  in every team-game, and 2020's `totalPlays` is `0` in 446 of 512. A `0` averages in
+  as a real low where a `NULL` would be skipped, so `v_team_defense_seasons` leaves
+  both out. They stay on `team_defense_games`. Worth checking any new column for this
+  before trusting it — `SUM(col) = 0` over a whole season is the tell.
 - **Unplayed games carry no box score.** Schedule entries without a final score are
   dropped from `player_games` and `team_defense_games` rather than stored as empty
   rows, so an in-progress season loads cleanly. `games` is the exception — see

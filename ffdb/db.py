@@ -491,6 +491,68 @@ VIEWS = {
         LEFT JOIN teams t ON t.team_id = td.team_id
         WHERE td.is_all_star = 0
     """,
+    # One row per team per season: that defense's per-game averages.
+    #
+    # Everything is per game (`_pg`), not a season total, so a 16-game 2020 and a
+    # 17-game 2021 compare directly; multiply by `games` for the total.
+    #
+    # Regular season only, since postseason games are played by better-than-average
+    # opponents and only by the teams that got there. 2026 cannot appear: a row
+    # exists here only once ESPN publishes a box score, so unplayed games are
+    # already absent - but check `games` before trusting a season in progress.
+    #
+    # Two stats ESPN publishes are deliberately left out, because it zero-fills
+    # them rather than omitting them, and a 0 averages in as a real low:
+    #
+    #   plays_allowed        0 in 446 of 2020's 512 games
+    #   redzone_tds_allowed  0 in every game, all seasons
+    #
+    # Both are still on `team_defense_games` if you want to handle them yourself.
+    # `redzone_att_allowed_pg` below is unaffected - red-zone trips faced are real,
+    # it is only what happened inside the 20 that is missing.
+    "v_team_defense_seasons": """
+        CREATE VIEW v_team_defense_seasons AS
+        SELECT
+            td.team_id,
+            t.abbreviation                                AS team_abbr,
+            t.display_name                                AS team_name,
+            td.season,
+            COUNT(*)                                      AS games,
+            ROUND(AVG(td.points_allowed), 2)              AS points_allowed_pg,
+            ROUND(AVG(td.yards_allowed), 2)               AS yards_allowed_pg,
+            ROUND(AVG(td.pass_yards_allowed), 2)          AS pass_yards_allowed_pg,
+            ROUND(AVG(td.rush_yards_allowed), 2)          AS rush_yards_allowed_pg,
+            ROUND(AVG(td.first_downs_allowed), 2)         AS first_downs_allowed_pg,
+            ROUND(AVG(td.pass_attempts_allowed), 2)       AS pass_attempts_allowed_pg,
+            ROUND(AVG(td.completions_allowed), 2)         AS completions_allowed_pg,
+            ROUND(AVG(td.rush_attempts_allowed), 2)       AS rush_attempts_allowed_pg,
+            ROUND(AVG(td.pass_tds_allowed), 2)            AS pass_tds_allowed_pg,
+            ROUND(AVG(td.rush_tds_allowed), 2)            AS rush_tds_allowed_pg,
+            ROUND(AVG(td.tds_allowed), 2)                 AS tds_allowed_pg,
+            ROUND(AVG(td.possession_seconds_allowed), 2)  AS possession_seconds_allowed_pg,
+            ROUND(AVG(td.turnovers_forced), 2)            AS turnovers_forced_pg,
+            ROUND(AVG(td.takeaways), 2)                   AS takeaways_pg,
+            ROUND(AVG(td.fumbles_recovered), 2)           AS fumbles_recovered_pg,
+            ROUND(AVG(td.sacks), 2)                       AS sacks_pg,
+            ROUND(AVG(td.interceptions), 2)               AS interceptions_pg,
+            ROUND(AVG(td.tacklesForLoss), 2)              AS tackles_for_loss_pg,
+            ROUND(AVG(td.QBHits), 2)                      AS qb_hits_pg,
+            ROUND(AVG(td.passesDefended), 2)              AS passes_defended_pg,
+            ROUND(AVG(td.defensiveTouchdowns), 2)         AS defensive_tds_pg,
+            ROUND(AVG(td.totalTackles), 2)                AS total_tackles_pg,
+            ROUND(AVG(td.redzone_att_allowed), 2)         AS redzone_att_allowed_pg,
+            -- Summed then divided, not averaged per game: the mean of per-game
+            -- percentages weights a 1-for-2 game the same as a 6-for-12.
+            ROUND(
+                100.0 * SUM(td.third_down_conv_allowed) / NULLIF(SUM(td.third_down_att_allowed), 0),
+                2
+            )                                             AS third_down_pct_allowed
+        FROM team_defense_games td
+        LEFT JOIN teams t ON t.team_id = td.team_id
+        WHERE td.is_all_star = 0
+          AND td.season_type = 2
+        GROUP BY td.team_id, td.season
+    """,
     # One row per player-game with the defense they faced attached, which is
     # the join the game logs are collected for.
     "v_player_games_vs_defense": """

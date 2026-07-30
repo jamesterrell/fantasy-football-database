@@ -479,6 +479,87 @@ class TestScheduleParsing(unittest.TestCase):
         conn.close()
 
 
+class TestTeamDefenseSeasonsView(unittest.TestCase):
+    """v_team_defense_seasons: one row per team per season, per-game averages."""
+
+    def setUp(self) -> None:
+        self.conn = db.connect(":memory:")
+        db.init_db(self.conn)
+        db.upsert_teams(
+            self.conn,
+            [{"team_id": "12", "abbreviation": "KC", "display_name": "Kansas City Chiefs"}],
+        )
+        # team_defense_games.event_id references games.event_id.
+        db.upsert_games(
+            self.conn, [{"event_id": str(i), "season": 2025} for i in range(1, 5)]
+        )
+        db.upsert_team_defense_games(
+            self.conn,
+            [
+                self._game("1", week=1, points=20, plays=60, third_att=10, third_conv=1),
+                self._game("2", week=2, points=30, plays=70, third_att=2, third_conv=1),
+                # Postseason, which the view excludes.
+                self._game("3", week=1, points=99, plays=99, season_type=3),
+                # Pro Bowl, excluded the same way the other views exclude it.
+                self._game("4", week=4, points=99, plays=99, is_all_star=1),
+            ],
+        )
+        db.rebuild_views(self.conn)
+
+    def tearDown(self) -> None:
+        self.conn.close()
+
+    @staticmethod
+    def _game(
+        event_id, week, points, plays, season_type=2, is_all_star=0,
+        third_att=10, third_conv=5,
+    ) -> dict:
+        return {
+            "team_id": "12", "event_id": event_id, "season": 2025,
+            "season_type": season_type, "week": week, "team_abbr": "KC",
+            "is_all_star": is_all_star, "points_allowed": float(points),
+            "plays_allowed": float(plays),
+            "third_down_att_allowed": float(third_att),
+            "third_down_conv_allowed": float(third_conv),
+            "_stats": {"sacks": 2.0},
+        }
+
+    def _row(self) -> dict:
+        rows = self.conn.execute("SELECT * FROM v_team_defense_seasons").fetchall()
+        self.assertEqual(len(rows), 1)  # one team, one season
+        return rows[0]
+
+    def test_one_row_per_team_per_season(self):
+        row = self._row()
+        self.assertEqual((row["team_abbr"], row["season"], row["games"]), ("KC", 2025, 2))
+
+    def test_averages_are_per_game(self):
+        self.assertEqual(self._row()["points_allowed_pg"], 25.0)  # (20 + 30) / 2
+
+    def test_postseason_and_exhibition_excluded(self):
+        # Both carry 99s; either one leaking in would move the average.
+        self.assertEqual(self._row()["points_allowed_pg"], 25.0)
+
+    def test_rate_is_summed_then_divided_not_averaged(self):
+        # 2/12 = 16.67%, not the 30% an average of 10% and 50% would give.
+        self.assertEqual(self._row()["third_down_pct_allowed"], 16.67)
+
+    def test_zero_filled_stats_are_not_exposed(self):
+        # ESPN zero-fills `redzoneTouchdowns` (every game) and 2020's
+        # `totalPlays` (446 of 512), so an average over either reads as a real
+        # low rather than as missing. Both are left out of this view entirely.
+        columns = set(self._row().keys())
+        for excluded in (
+            "redzone_td_pct_allowed",
+            "redzone_tds_allowed_pg",
+            "plays_allowed_pg",
+            "plays_allowed_games",
+        ):
+            self.assertNotIn(excluded, columns)
+        # Red-zone trips faced are real, and stay.
+        self.assertIn("redzone_att_allowed_pg", columns)
+
+
 class TestTeamScheduleView(unittest.TestCase):
     """v_team_schedule: one row per team per regular-season game."""
 
