@@ -479,6 +479,132 @@ class TestScheduleParsing(unittest.TestCase):
         conn.close()
 
 
+class TestTeamScheduleView(unittest.TestCase):
+    """v_team_schedule: one row per team per regular-season game."""
+
+    def setUp(self) -> None:
+        self.conn = db.connect(":memory:")
+        db.init_db(self.conn)
+        db.upsert_games(
+            self.conn,
+            [
+                # Played, and labelled the way schedule loads label it.
+                {
+                    "event_id": "1", "season": 2025, "season_type": 2,
+                    "season_type_name": "Regular Season", "week": 1,
+                    "home_team_id": "12", "away_team_id": "33", "score": "20-27",
+                },
+                # Played, labelled the way older game-log loads label it.
+                {
+                    "event_id": "2", "season": 2019, "season_type": 2,
+                    "season_type_name": "2019 Regular Season", "week": 5,
+                    "home_team_id": "12", "away_team_id": "3", "score": "10-14",
+                },
+                # Upcoming: no score yet.
+                {
+                    "event_id": "3", "season": 2026, "season_type": 2,
+                    "season_type_name": "Regular Season", "week": 2,
+                    "home_team_id": "3", "away_team_id": "12", "score": None,
+                },
+                # Postseason, which the view excludes.
+                {
+                    "event_id": "4", "season": 2025, "season_type": 3,
+                    "season_type_name": "2025 Postseason", "week": 1,
+                    "home_team_id": "12", "away_team_id": "33", "score": "17-3",
+                },
+            ],
+        )
+        db.rebuild_views(self.conn)
+
+    def tearDown(self) -> None:
+        self.conn.close()
+
+    def _rows(self, **where) -> list[dict]:
+        clause = " AND ".join(f"{k} = ?" for k in where) or "1"
+        return self.conn.execute(
+            f"SELECT * FROM v_team_schedule WHERE {clause}", tuple(where.values())
+        ).fetchall()
+
+    def test_each_game_appears_from_both_sides(self):
+        rows = self._rows(event_id="1")
+        self.assertEqual(
+            sorted((r["team"], r["opponent"]) for r in rows),
+            [("12", "33"), ("33", "12")],
+        )
+
+    def test_postseason_excluded(self):
+        self.assertEqual(self._rows(event_id="4"), [])
+
+    def test_year_prefixed_season_names_are_not_dropped(self):
+        # 'Regular Season' vs '2019 Regular Season' - filtering on the label
+        # instead of season_type would lose the older seasons entirely.
+        self.assertEqual(len(self._rows(event_id="2")), 2)
+
+    def test_upcoming_games_have_no_score(self):
+        rows = self._rows(season=2026)
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(r["score"] is None for r in rows))
+        self.assertEqual({r["week"] for r in rows}, {2})
+
+    def test_row_count_is_two_per_regular_season_game(self):
+        games = self.conn.execute(
+            "SELECT COUNT(*) FROM games WHERE season_type = 2"
+        ).fetchone()[0]
+        self.assertEqual(len(self._rows()), games * 2)
+
+
+class TestUpcomingSchedule(unittest.TestCase):
+    """A season's games have to load before any of them are played."""
+
+    def setUp(self) -> None:
+        self.matchups = teamdefense.parse_schedule(
+            make_schedule_payload(), include_unplayed=True
+        )
+
+    def test_unplayed_games_kept_on_request(self):
+        self.assertEqual([m["event_id"] for m in self.matchups], ["401671789", "999"])
+
+    def test_matchup_known_without_a_result(self):
+        upcoming = self.matchups[1]
+        self.assertEqual(upcoming["week"], 2)
+        self.assertEqual(upcoming["home"]["team_id"], "3")
+        self.assertEqual(upcoming["away"]["team_id"], "12")
+        self.assertIsNone(upcoming["home"]["score"])
+
+    def test_outcome_fields_are_null(self):
+        row = teamdefense.game_row(self.matchups[1])
+        self.assertIsNone(row["home_score"])
+        self.assertIsNone(row["away_score"])
+        self.assertIsNone(row["score"])
+        self.assertEqual((row["season"], row["week"]), (2024, 2))
+
+    def test_stored_and_queryable_as_upcoming(self):
+        conn = db.connect(":memory:")
+        db.init_db(conn)
+        db.upsert_games(conn, [teamdefense.game_row(m) for m in self.matchups])
+        upcoming = conn.execute(
+            "SELECT event_id FROM games WHERE score IS NULL"
+        ).fetchall()
+        self.assertEqual([r["event_id"] for r in upcoming], ["999"])
+        conn.close()
+
+    def test_result_replaces_the_null_row_in_place(self):
+        # Once the game is played the same event_id upserts over the empty row
+        # rather than adding a second one.
+        conn = db.connect(":memory:")
+        db.init_db(conn)
+        db.upsert_games(conn, [teamdefense.game_row(self.matchups[1])])
+
+        played = teamdefense.game_row(self.matchups[1])
+        played.update(home_score=17.0, away_score=24.0, score="24-17")
+        db.upsert_games(conn, [played])
+
+        rows = conn.execute("SELECT * FROM games WHERE event_id = '999'").fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["score"], "24-17")
+        conn.close()
+
+
 class TestTeamDefenseParsing(unittest.TestCase):
     def setUp(self) -> None:
         self.matchup = teamdefense.parse_schedule(make_schedule_payload())[0]
@@ -615,8 +741,10 @@ class TestTeamDefenseStorage(unittest.TestCase):
         self.assertTrue(set(db.TEAM_DEFENSE_BASELINE_STATS) <= columns)
 
     def test_views_are_queryable_on_an_empty_database(self):
+        # SQLite accepts a view naming a column that does not exist and only
+        # fails when it is queried, so every view has to be exercised.
         db.rebuild_views(self.conn)
-        for view in ("v_team_defense", "v_player_games_vs_defense"):
+        for view in db.VIEWS:
             self.conn.execute(f"SELECT * FROM {view} LIMIT 1").fetchall()
 
     def test_defense_joins_onto_a_player_game(self):

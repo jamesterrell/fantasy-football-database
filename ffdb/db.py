@@ -511,6 +511,30 @@ VIEWS = {
                ON td.event_id = pg.event_id
               AND td.team_id  = pg.opponent_id
     """,
+    # Every regular-season game twice, once from each team's point of view, so a
+    # team's schedule (including 2026's, still unplayed) reads as one row per
+    # week with the opponent alongside. `score` is NULL until the game is played.
+    #
+    # Filtered on season_type rather than season_type_name: ESPN's own label is
+    # bare ("Regular Season") on schedule-loaded rows but year-prefixed
+    # ("2019 Regular Season") on older game-log rows, so matching the text drops
+    # the earlier seasons. The id is 2 in both cases.
+    "v_team_schedule": """
+        CREATE VIEW v_team_schedule AS
+        WITH both_sides AS (
+            SELECT event_id, season_type_name, season, week,
+                   home_team_id AS team, away_team_id AS opponent, score
+            FROM games
+            WHERE season_type = 2
+            UNION ALL
+            SELECT event_id, season_type_name, season, week,
+                   away_team_id AS team, home_team_id AS opponent, score
+            FROM games
+            WHERE season_type = 2
+        )
+        SELECT * FROM both_sides
+        ORDER BY season, week, team, opponent
+    """,
     "v_rankings": """
         CREATE VIEW v_rankings AS
         SELECT r.season, r.scoring, r.rank,
