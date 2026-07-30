@@ -36,7 +36,7 @@ python -m ffdb schedule --season 2026             # a season's matchups, upcomin
 python -m ffdb add "Josh Allen" "Ja'Marr Chase"   # batch; one failure won't abort the run
 python -m ffdb add 4242335 --season 2025 --force  # by id, one season, bypass the cache
 python -m ffdb index --search "Justin Tucker"     # look up ESPN athlete ids
-python -m unittest discover -s tests              # 53 tests, no network needed
+python -m unittest discover -s tests              # 58 tests, no network needed
 ```
 
 `--force` re-fetches from ESPN instead of reading the local archive. Use it for the
@@ -142,7 +142,8 @@ Views (rebuilt on every load): `v_player_games` adds player name/position and
 excludes exhibition games; `v_player_seasons` aggregates fantasy points per season;
 `v_rankings` is the ranking with names and teams joined on; `v_team_defense` adds
 team names; `v_player_games_vs_defense` attaches the opposing defense to every
-player-game.
+player-game; `v_team_schedule` is every regular-season game from both teams' points
+of view, one row per team per week.
 
 **Stat columns are dynamic.** ESPN publishes a different stat vocabulary per
 position — a QB log has `passingYards` and `QBRating`, a RB log has
@@ -225,6 +226,20 @@ Re-running upserts on `event_id`, so a game moved by flex scheduling updates in
 place and scores fill in as the season is played — no duplicate rows, no separate
 "predictions" table to reconcile. Add `--force` to bypass the archive, which you
 want whenever the schedule may have shifted.
+
+`v_team_schedule` turns `games` into one row per team per week — every
+regular-season game twice, once from each side — which is the shape a per-player
+prediction row needs:
+
+```sql
+SELECT week, opponent, score FROM v_team_schedule
+WHERE season = 2026 AND team = '11' ORDER BY week;   -- the Colts' 2026 season
+```
+
+It filters on `season_type = 2` rather than the `season_type_name` text, because
+ESPN labels the same thing two ways: schedule loads say `Regular Season` and older
+game-log loads say `2019 Regular Season`. Matching the label would quietly drop
+every pre-2020 season.
 
 Postseason events don't exist upstream until the bracket is set, so `--postseason`
 returns nothing for a future season.

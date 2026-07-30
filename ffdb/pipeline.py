@@ -178,6 +178,7 @@ def build_schedule(
     rows = [teamdefense.game_row(m) for m in matchups.values()]
     loaded = db.upsert_games(conn, rows)
     unplayed = sum(1 for r in rows if r["score"] is None)
+    db.rebuild_views(conn)
 
     log.info(
         "%s: %d events across %d teams (%d not played yet)",
