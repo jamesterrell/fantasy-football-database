@@ -479,6 +479,58 @@ class TestScheduleParsing(unittest.TestCase):
         conn.close()
 
 
+class TestUpcomingSchedule(unittest.TestCase):
+    """A season's games have to load before any of them are played."""
+
+    def setUp(self) -> None:
+        self.matchups = teamdefense.parse_schedule(
+            make_schedule_payload(), include_unplayed=True
+        )
+
+    def test_unplayed_games_kept_on_request(self):
+        self.assertEqual([m["event_id"] for m in self.matchups], ["401671789", "999"])
+
+    def test_matchup_known_without_a_result(self):
+        upcoming = self.matchups[1]
+        self.assertEqual(upcoming["week"], 2)
+        self.assertEqual(upcoming["home"]["team_id"], "3")
+        self.assertEqual(upcoming["away"]["team_id"], "12")
+        self.assertIsNone(upcoming["home"]["score"])
+
+    def test_outcome_fields_are_null(self):
+        row = teamdefense.game_row(self.matchups[1])
+        self.assertIsNone(row["home_score"])
+        self.assertIsNone(row["away_score"])
+        self.assertIsNone(row["score"])
+        self.assertEqual((row["season"], row["week"]), (2024, 2))
+
+    def test_stored_and_queryable_as_upcoming(self):
+        conn = db.connect(":memory:")
+        db.init_db(conn)
+        db.upsert_games(conn, [teamdefense.game_row(m) for m in self.matchups])
+        upcoming = conn.execute(
+            "SELECT event_id FROM games WHERE score IS NULL"
+        ).fetchall()
+        self.assertEqual([r["event_id"] for r in upcoming], ["999"])
+        conn.close()
+
+    def test_result_replaces_the_null_row_in_place(self):
+        # Once the game is played the same event_id upserts over the empty row
+        # rather than adding a second one.
+        conn = db.connect(":memory:")
+        db.init_db(conn)
+        db.upsert_games(conn, [teamdefense.game_row(self.matchups[1])])
+
+        played = teamdefense.game_row(self.matchups[1])
+        played.update(home_score=17.0, away_score=24.0, score="24-17")
+        db.upsert_games(conn, [played])
+
+        rows = conn.execute("SELECT * FROM games WHERE event_id = '999'").fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["score"], "24-17")
+        conn.close()
+
+
 class TestTeamDefenseParsing(unittest.TestCase):
     def setUp(self) -> None:
         self.matchup = teamdefense.parse_schedule(make_schedule_payload())[0]

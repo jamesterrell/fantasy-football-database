@@ -162,6 +162,46 @@ def cmd_rankings(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_schedule(args: argparse.Namespace) -> int:
+    conn = db.connect(args.db)
+    db.init_db(conn)
+    season_types = [config.SEASON_TYPE_REGULAR]
+    if args.postseason:
+        season_types.append(config.SEASON_TYPE_POST)
+
+    result = pipeline.build_schedule(
+        conn, _client(args), season=args.season,
+        season_types=season_types, teams=args.team, force=args.force,
+    )
+    print(
+        f"{result['season']}: {result['events']} games across {result['teams']} teams "
+        f"({result['unplayed']} not played yet)"
+    )
+
+    rows = conn.execute(
+        """
+        SELECT week, COUNT(*) AS games,
+               SUM(score IS NULL) AS upcoming,
+               MIN(substr(game_date, 1, 10)) AS first_kickoff
+        FROM games
+        WHERE season = ? AND season_type = ? AND is_all_star = 0
+        GROUP BY week
+        ORDER BY week
+        """,
+        (args.season, config.SEASON_TYPE_REGULAR),
+    ).fetchall()
+    if rows:
+        header = f"{'WEEK':>5}{'GMS':>5}{'UPCOMING':>10}  FIRST KICKOFF"
+        print("\n" + header)
+        print("-" * len(header))
+        for r in rows:
+            print(
+                f"{r['week']:>5}{r['games']:>5}{r['upcoming']:>10}  {r['first_kickoff'] or '?'}"
+            )
+    conn.close()
+    return 0
+
+
 def cmd_defense(args: argparse.Namespace) -> int:
     conn = db.connect(args.db)
     db.init_db(conn)
@@ -262,6 +302,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_rank.add_argument("--top", type=int, default=50)
     p_rank.add_argument("--scoring", default=ranking.DEFAULT_SCORING, choices=sorted(scoring.FORMATS))
     p_rank.set_defaults(func=cmd_rankings)
+
+    p_sched = sub.add_parser(
+        "schedule", help="load a season's schedule into games, upcoming games included"
+    )
+    p_sched.add_argument("--season", type=int, required=True)
+    p_sched.add_argument(
+        "--team", action="append", help="limit to team abbreviation(s), e.g. --team KC"
+    )
+    p_sched.add_argument("--postseason", action="store_true", help="include playoff games")
+    p_sched.add_argument(
+        "--force", action="store_true", help="re-fetch instead of using the archive"
+    )
+    p_sched.set_defaults(func=cmd_schedule)
 
     p_def = sub.add_parser("defense", help="load team defense game logs for a season")
     p_def.add_argument("--season", type=int, required=True)

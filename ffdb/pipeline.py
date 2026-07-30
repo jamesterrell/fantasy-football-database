@@ -108,19 +108,16 @@ def build_players(
     return summaries, failures
 
 
-def build_team_defense(
+def _select_teams(
     conn: sqlite3.Connection,
     client: ESPNClient,
-    season: int,
-    season_types: Iterable[int] = (config.SEASON_TYPE_REGULAR,),
     teams: Iterable[str] | None = None,
     force: bool = False,
-) -> dict:
-    """Load every team's defensive game log for one season.
+) -> list[dict]:
+    """Resolve a team filter to team records, storing every team on the way.
 
-    Each event is fetched once even though two teams' schedules list it, and
-    both competitors' stat lines are read together - a defense's allowed
-    numbers are the opposing offense's own numbers.
+    All 32 are stored regardless of the filter: an event's opponent has to be
+    in `teams` for the abbreviation joins to resolve.
     """
     all_teams = rosters.fetch_teams(client, force=force)
     db.upsert_teams(conn, all_teams)
@@ -135,16 +132,82 @@ def build_team_defense(
     ]
     if wanted and not selected:
         raise ValueError(f"no NFL team matched {sorted(wanted)}")
+    return selected
 
-    # event_id -> matchup, deduped across the schedules that mention it.
+
+def _collect_matchups(
+    client: ESPNClient,
+    teams: Iterable[dict],
+    season: int,
+    season_types: Iterable[int],
+    include_unplayed: bool = False,
+    force: bool = False,
+) -> dict[str, dict]:
+    """event_id -> matchup, deduped across the two schedules listing each game."""
     matchups: dict[str, dict] = {}
-    for team in selected:
+    for team in teams:
         for season_type in season_types:
             payload = teamdefense.fetch_schedule(
                 client, team["team_id"], season, season_type, force=force
             )
-            for matchup in teamdefense.parse_schedule(payload):
+            for matchup in teamdefense.parse_schedule(payload, include_unplayed=include_unplayed):
                 matchups.setdefault(matchup["event_id"], matchup)
+    return matchups
+
+
+def build_schedule(
+    conn: sqlite3.Connection,
+    client: ESPNClient,
+    season: int,
+    season_types: Iterable[int] = (config.SEASON_TYPE_REGULAR,),
+    teams: Iterable[str] | None = None,
+    force: bool = False,
+) -> dict:
+    """Load a season's schedule into `games`, games not yet played included.
+
+    This is how a season's rows exist before it starts: predicting week 3 needs
+    the week 3 matchup, which ESPN publishes months ahead while the result
+    stays NULL until kickoff. Re-running it upserts on `event_id`, so a game
+    moved by flex scheduling updates in place and scores fill in once played.
+    """
+    selected = _select_teams(conn, client, teams, force=force)
+    matchups = _collect_matchups(
+        client, selected, season, season_types, include_unplayed=True, force=force
+    )
+
+    rows = [teamdefense.game_row(m) for m in matchups.values()]
+    loaded = db.upsert_games(conn, rows)
+    unplayed = sum(1 for r in rows if r["score"] is None)
+
+    log.info(
+        "%s: %d events across %d teams (%d not played yet)",
+        season, loaded, len(selected), unplayed,
+    )
+    return {
+        "season": season,
+        "teams": len(selected),
+        "events": loaded,
+        "unplayed": unplayed,
+    }
+
+
+def build_team_defense(
+    conn: sqlite3.Connection,
+    client: ESPNClient,
+    season: int,
+    season_types: Iterable[int] = (config.SEASON_TYPE_REGULAR,),
+    teams: Iterable[str] | None = None,
+    force: bool = False,
+) -> dict:
+    """Load every team's defensive game log for one season.
+
+    Each event is fetched once even though two teams' schedules list it, and
+    both competitors' stat lines are read together - a defense's allowed
+    numbers are the opposing offense's own numbers.
+    """
+    selected = _select_teams(conn, client, teams, force=force)
+    # Unplayed games are left out: there are no stats to build a row from.
+    matchups = _collect_matchups(client, selected, season, season_types, force=force)
 
     log.info("%s: %d events across %d teams", season, len(matchups), len(selected))
 

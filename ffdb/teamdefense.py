@@ -100,11 +100,14 @@ def fetch_schedule(
     )
 
 
-def parse_schedule(payload: dict) -> list[dict]:
-    """Matchups from a schedule payload, one per completed event.
+def parse_schedule(payload: dict, include_unplayed: bool = False) -> list[dict]:
+    """Matchups from a schedule payload, one per event.
 
     Events without a final score have not been played yet and carry no stats,
-    so they are dropped rather than stored as empty rows.
+    so by default they are dropped rather than stored as empty rows. Pass
+    `include_unplayed=True` to keep them, which is what loading an upcoming
+    season's schedule into `games` wants: the matchup is known months before
+    kickoff even though the result is not.
     """
     matchups = []
     for event in payload.get("events") or []:
@@ -132,8 +135,10 @@ def parse_schedule(payload: dict) -> list[dict]:
                     "score": _to_number((competitor.get("score") or {}).get("value")),
                 }
             )
-        if len(sides) != 2 or any(s["score"] is None for s in sides):
-            continue  # not played yet, or an unusable record
+        if len(sides) != 2:
+            continue  # an unusable record
+        if any(s["score"] is None for s in sides) and not include_unplayed:
+            continue  # not played yet
 
         season_type = event.get("seasonType") or {}
         week = event.get("week") or {}
@@ -158,7 +163,14 @@ def parse_schedule(payload: dict) -> list[dict]:
 
 
 def game_row(matchup: dict) -> dict:
-    """A `games` row, so team defense rows have an event to reference."""
+    """A `games` row, so team defense rows have an event to reference.
+
+    An unplayed matchup produces the same row with every outcome field NULL,
+    which is what marks a game as still upcoming.
+    """
+    home_score = matchup["home"]["score"]
+    away_score = matchup["away"]["score"]
+    played = home_score is not None and away_score is not None
     return {
         "event_id": matchup["event_id"],
         "season": matchup["season"],
@@ -168,9 +180,9 @@ def game_row(matchup: dict) -> dict:
         "game_date": matchup["game_date"],
         "home_team_id": matchup["home"]["team_id"],
         "away_team_id": matchup["away"]["team_id"],
-        "home_score": matchup["home"]["score"],
-        "away_score": matchup["away"]["score"],
-        "score": f"{matchup['away']['score']:.0f}-{matchup['home']['score']:.0f}",
+        "home_score": home_score,
+        "away_score": away_score,
+        "score": f"{away_score:.0f}-{home_score:.0f}" if played else None,
         "is_all_star": matchup["is_all_star"],
     }
 

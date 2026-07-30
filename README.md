@@ -32,10 +32,11 @@ python -m ffdb build-top --season 2025 --top 200  # derive the top 200 and load 
 python -m ffdb rankings --season 2025 --top 50    # show a stored ranking
 python -m ffdb defense --season 2024              # team defense game logs, all 32 teams
 python -m ffdb defense --season 2024 --team KC    # just one team's schedule
+python -m ffdb schedule --season 2026             # a season's matchups, upcoming games included
 python -m ffdb add "Josh Allen" "Ja'Marr Chase"   # batch; one failure won't abort the run
 python -m ffdb add 4242335 --season 2025 --force  # by id, one season, bypass the cache
 python -m ffdb index --search "Justin Tucker"     # look up ESPN athlete ids
-python -m unittest discover -s tests              # 48 tests, no network needed
+python -m unittest discover -s tests              # 53 tests, no network needed
 ```
 
 `--force` re-fetches from ESPN instead of reading the local archive. Use it for the
@@ -130,7 +131,7 @@ Regular season is `season_type = 2`, postseason is `3`.
 |---|---|
 | `athletes` | one row per player: position, team, height/weight, birth date, experience |
 | `teams` | the 32 NFL teams |
-| `games` | one row per NFL game seen: season, week, date, both teams, final score |
+| `games` | one row per NFL game seen: season, week, date, both teams, final score (NULL until played) |
 | `player_games` | **the modelling table** - one row per player per game |
 | `team_defense_games` | one row per team per game: what that defense did and gave up |
 | `rankings` | derived top-N by season and scoring format, with position rank |
@@ -197,6 +198,37 @@ WHERE pg.season = 2024;
 > Using it directly as a model input leaks the outcome. For opponent strength, build
 > a season-to-date or trailing-N average that excludes the current game.
 
+## Schedule and upcoming games
+
+Predicting week 3 needs the week 3 matchup, and ESPN publishes a full season's
+schedule months before it starts. `schedule` loads those events into `games` with
+every outcome field left `NULL`:
+
+```bash
+python -m ffdb schedule --season 2026   # 272 games, 18 weeks, none played yet
+```
+
+This is the one place unplayed events are stored, and it is deliberate: the matchup
+(week, kickoff time, both teams, home/away) is known, only the result is missing.
+`score IS NULL` is what separates a prediction row from a played one:
+
+```sql
+SELECT g.week, a.abbreviation AS away, h.abbreviation AS home, g.game_date
+FROM games g
+JOIN teams h ON h.team_id = g.home_team_id
+JOIN teams a ON a.team_id = g.away_team_id
+WHERE g.season = 2026 AND g.score IS NULL
+ORDER BY g.week, g.game_date;
+```
+
+Re-running upserts on `event_id`, so a game moved by flex scheduling updates in
+place and scores fill in as the season is played — no duplicate rows, no separate
+"predictions" table to reconcile. Add `--force` to bypass the archive, which you
+want whenever the schedule may have shifted.
+
+Postseason events don't exist upstream until the bracket is set, so `--postseason`
+returns nothing for a future season.
+
 ## Data quality notes
 
 Things that were found the hard way and are handled in code:
@@ -215,7 +247,9 @@ Things that were found the hard way and are handled in code:
   on a team defense row. `stat_catalog` is keyed by `(table_name, stat_name)` so both
   meanings coexist.
 - **Unplayed games carry no box score.** Schedule entries without a final score are
-  dropped rather than stored as empty rows, so an in-progress season loads cleanly.
+  dropped from `player_games` and `team_defense_games` rather than stored as empty
+  rows, so an in-progress season loads cleanly. `games` is the exception — see
+  [Schedule and upcoming games](#schedule-and-upcoming-games).
 
 Known upstream limitations, not worked around:
 
