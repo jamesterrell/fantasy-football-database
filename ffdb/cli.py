@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from . import athletes as athletes_mod
-from . import config, db, pipeline, ranking, scoring
+from . import config, db, pipeline, ranking, scoring, seasonpool
 from .espn import ESPNClient
 
 
@@ -131,6 +131,60 @@ def cmd_build_top(args: argparse.Namespace) -> int:
     )
     conn.close()
     return 0
+
+
+def _season_range(values: list[str]) -> list[int]:
+    """Accept `2022`, `2020-2024`, or several of either."""
+    seasons: set[int] = set()
+    for value in values:
+        if "-" in value:
+            start, _, end = value.partition("-")
+            seasons.update(range(int(start), int(end) + 1))
+        else:
+            seasons.add(int(value))
+    return sorted(seasons)
+
+
+def cmd_build_season(args: argparse.Namespace) -> int:
+    conn = db.connect(args.db)
+    db.init_db(conn)
+    result = seasonpool.build_seasons(
+        conn, _client(args), seasons=_season_range(args.season),
+        force=args.force, resync=args.resync,
+    )
+    print(
+        f"\n{result['discovered']} players appeared in {result['seasons']}; "
+        f"{result['kept']} at fantasy positions"
+    )
+    print(
+        f"pulled {result['pulled']} players ({result['games']} games); "
+        f"{result['already_synced']} already complete"
+    )
+    if result["unresolved"]:
+        print(
+            f"{len(result['unresolved'])} players had no resolvable position "
+            "and were left out:", file=sys.stderr,
+        )
+        for athlete_id, name in result["unresolved"]:
+            print(f"  {name} ({athlete_id})", file=sys.stderr)
+    if result["failed"]:
+        print(f"{len(result['failed'])} failed:", file=sys.stderr)
+        for athlete_id, error in result["failed"]:
+            print(f"  {athlete_id}: {error}", file=sys.stderr)
+
+    rows = conn.execute(
+        "SELECT season, COUNT(DISTINCT athlete_id) AS players, COUNT(*) AS games "
+        "FROM player_games WHERE season_type = 2 AND is_all_star = 0 "
+        "AND season BETWEEN ? AND ? GROUP BY season ORDER BY season",
+        (min(result["seasons"]), max(result["seasons"])),
+    ).fetchall()
+    if rows:
+        print(f"\n{'SEASON':<8}{'PLAYERS':>9}{'GAMES':>8}")
+        print("-" * 25)
+        for r in rows:
+            print(f"{r['season']:<8}{r['players']:>9}{r['games']:>8}")
+    conn.close()
+    return 1 if result["failed"] else 0
 
 
 def cmd_rankings(args: argparse.Namespace) -> int:
@@ -296,6 +350,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_top.add_argument("--scoring", default=ranking.DEFAULT_SCORING, choices=sorted(scoring.FORMATS))
     p_top.add_argument("--force", action="store_true")
     p_top.set_defaults(func=cmd_build_top)
+
+    p_season = sub.add_parser(
+        "build-season",
+        help="load every fantasy-position player who appeared in a season (no top-N filter)",
+    )
+    p_season.add_argument(
+        "--season", action="append", required=True,
+        help="season or range, e.g. --season 2020-2024 (repeatable)",
+    )
+    p_season.add_argument(
+        "--resync", action="store_true",
+        help="re-pull athlete-seasons already recorded in sync_log",
+    )
+    p_season.add_argument("--force", action="store_true", help="ignore the raw JSON archive")
+    p_season.set_defaults(func=cmd_build_season)
 
     p_rank = sub.add_parser("rankings", help="show a stored ranking")
     p_rank.add_argument("--season", type=int, required=True)

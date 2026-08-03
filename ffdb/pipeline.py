@@ -19,12 +19,15 @@ def build_player(
     seasons: Iterable[int] | None = None,
     force: bool = False,
     profile: dict | None = None,
+    rebuild_views: bool = True,
 ) -> dict:
     """Load one player's full career of game logs.
 
     `force=True` bypasses the raw JSON archive and re-fetches from ESPN, which
     is what you want for the in-progress season. Pass `profile` when the caller
     already has the athlete's details (a roster load does) to skip two requests.
+    Batch callers loading many players should pass `rebuild_views=False` and
+    rebuild once at the end.
     """
     if profile is None:
         athlete_id = athletes.resolve_athlete_id(client, name_or_id, force=force)
@@ -78,7 +81,8 @@ def build_player(
             season_list,
         )
 
-    db.rebuild_views(conn)
+    if rebuild_views:
+        db.rebuild_views(conn)
     return {
         "athlete_id": athlete_id,
         "name": name,

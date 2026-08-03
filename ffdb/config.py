@@ -25,6 +25,10 @@ SEARCH_URL = "https://site.web.api.espn.com/apis/search/v2"
 TEAMS_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams"
 ROSTER_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/{team_id}/roster"
 
+# Box scores, used to enumerate who actually played in a past season. The
+# summary endpoint lists every athlete who recorded a stat in one event.
+SUMMARY_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/summary"
+
 # Team defense. The schedule supplies the season's events; the per-competitor
 # statistics endpoint supplies one team's full stat line for one of them.
 TEAM_SCHEDULE_URL = (
