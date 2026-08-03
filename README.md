@@ -348,6 +348,14 @@ Things that were found the hard way and are handled in code:
   as a real low where a `NULL` would be skipped, so `v_team_defense_seasons` leaves
   both out. They stay on `team_defense_games`. Worth checking any new column for this
   before trusting it — `SUM(col) = 0` over a whole season is the tell.
+- **2021 game logs omit some scoreless appearances.** Holding the player set fixed,
+  the same 417 players show 21.9% zero-point games in 2020, 15.6% in 2021, then 25.6%
+  in 2022 — so it is the season, not who was in it. 2021 carries ~20 fewer player rows
+  per game-week than its neighbours and the shortfall is almost entirely scoreless
+  games, which lifts its mean PPR to 7.99 against 6.7–6.9 either side. Nothing is
+  wrong with the rows that are there; they are simply missing the quiet games. Worth a
+  season indicator in any model trained across it, and a reason not to read 2021 as a
+  genuinely higher-scoring year.
 - **An abandoned game has a schedule row and no box score.** 2022 week 17 BUF at CIN
   (event `401437947`) was called off after Damar Hamlin's collapse and never resumed;
   it is stored `0-0` with a summary containing no players. `build-season` logs it and
