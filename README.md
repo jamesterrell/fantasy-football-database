@@ -98,10 +98,53 @@ knowing before modelling on it:
 - **Kickers and defenses are excluded.** Their scoring rules aren't implemented, and
   including them would rank them at zero.
 - **Currently rostered players only.** The pool comes from today's rosters, so a
-  productive player who is now unsigned is missed. This aligns with what the game log
-  endpoint will serve anyway (see the note on unrostered players below).
+  productive player who is now unsigned is missed. Use `build-season` (below) for a
+  complete historical season — this limitation is exactly what it exists to fix.
 - **Regular season only.** Postseason games aren't available to every player and would
   reward being on a good team.
+
+## Building a complete season
+
+`build-top` answers "who were the best players?", which is the wrong question for
+training data. Backfilling earlier seasons from today's top 200 reproduces the
+present in the past: a player who produced in 2021 and left the league by 2025
+never appears, so the older a season is, the more it looks like a list of players
+who happened to survive.
+
+`build-season` enumerates from **box scores** instead. Every player who recorded a
+stat in a game is in that game's box score permanently, so the union over a season's
+events is exactly who played it — retired, cut and injured included. Since fantasy
+points can only come from passing, rushing or receiving, and each puts a player in
+the matching box score category, scanning those three cannot miss anyone who scored.
+
+```bash
+python -m ffdb schedule --season 2022      # once, so `games` has the events
+python -m ffdb build-season --season 2020-2024
+```
+
+| phase | what it does | cost |
+|---|---|---|
+| discover | scan every event's box score for the season | 1 request per game (~272) |
+| resolve | look up each new player's position, keep QB/RB/WR/TE | ~2 per *new* player |
+| pull | load the game log for each athlete-season | ~1 per athlete-season |
+
+`--season` takes a year or a range, repeatably. Interrupting is safe: `sync_log`
+records each athlete-season as it lands and a rerun skips it, so the job resumes
+where it stopped. Pass `--resync` to re-pull anyway.
+
+The season filter is deliberately *not* applied per game. Roughly a quarter of all
+player-games score exactly zero, and dropping those individually would filter on the
+target — the model would never see what a bust looks like. Every game of every
+player who appeared is kept; filter on season totals at query time if you want to:
+
+```sql
+WITH scorers AS (
+  SELECT athlete_id, season FROM player_games
+  WHERE season_type = 2 GROUP BY athlete_id, season HAVING SUM(fp_ppr) > 0
+)
+SELECT g.* FROM player_games g
+JOIN scorers s ON s.athlete_id = g.athlete_id AND s.season = g.season
+```
 
 ## Querying the data
 
@@ -305,6 +348,18 @@ Things that were found the hard way and are handled in code:
   as a real low where a `NULL` would be skipped, so `v_team_defense_seasons` leaves
   both out. They stay on `team_defense_games`. Worth checking any new column for this
   before trusting it — `SUM(col) = 0` over a whole season is the tell.
+- **2021 game logs omit some scoreless appearances.** Holding the player set fixed,
+  the same 417 players show 21.9% zero-point games in 2020, 15.6% in 2021, then 25.6%
+  in 2022 — so it is the season, not who was in it. 2021 carries ~20 fewer player rows
+  per game-week than its neighbours and the shortfall is almost entirely scoreless
+  games, which lifts its mean PPR to 7.99 against 6.7–6.9 either side. Nothing is
+  wrong with the rows that are there; they are simply missing the quiet games. Worth a
+  season indicator in any model trained across it, and a reason not to read 2021 as a
+  genuinely higher-scoring year.
+- **An abandoned game has a schedule row and no box score.** 2022 week 17 BUF at CIN
+  (event `401437947`) was called off after Damar Hamlin's collapse and never resumed;
+  it is stored `0-0` with a summary containing no players. `build-season` logs it and
+  moves on. No player is lost — both teams played their other 16 games.
 - **Unplayed games carry no box score.** Schedule entries without a final score are
   dropped from `player_games` and `team_defense_games` rather than stored as empty
   rows, so an in-progress season loads cleanly. `games` is the exception — see

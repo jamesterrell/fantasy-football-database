@@ -13,7 +13,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ffdb import athletes, db, gamelog, ranking, rosters, scoring, teamdefense  # noqa: E402
+from ffdb import (  # noqa: E402
+    athletes,
+    db,
+    gamelog,
+    ranking,
+    rosters,
+    scoring,
+    seasonpool,
+    teamdefense,
+)
 
 
 def make_payload() -> dict:
@@ -852,6 +861,125 @@ class TestTeamDefenseStorage(unittest.TestCase):
         # The back faced BAL, so the defensive line attached is BAL's.
         self.assertEqual(row["def_points_allowed"], 27.0)
         self.assertEqual(row["def_sacks"], 1.0)
+
+
+def make_boxscore(*teams: list[tuple[str, list[tuple[str, str]]]]) -> dict:
+    """A summary payload from (category, [(id, name)]) pairs per team."""
+    return {
+        "boxscore": {
+            "players": [
+                {
+                    "statistics": [
+                        {
+                            "name": category,
+                            "athletes": [
+                                {"athlete": {"id": aid, "displayName": name}, "stats": []}
+                                for aid, name in entries
+                            ],
+                        }
+                        for category, entries in team
+                    ]
+                }
+                for team in teams
+            ]
+        }
+    }
+
+
+class TestBoxscoreEnumeration(unittest.TestCase):
+    def setUp(self) -> None:
+        self.payload = make_boxscore(
+            [
+                ("passing", [("1", "A QB")]),
+                ("rushing", [("1", "A QB"), ("2", "A RB")]),
+                ("receiving", [("3", "A WR")]),
+                ("defensive", [("9", "A Linebacker")]),
+                ("kicking", [("8", "A Kicker")]),
+            ],
+            [("receiving", [("4", "Another WR")])],
+        )
+
+    def test_collects_both_teams(self):
+        found = seasonpool.athletes_from_boxscore(self.payload)
+        self.assertEqual(set(found), {"1", "2", "3", "4"})
+
+    def test_non_scoring_categories_excluded(self):
+        # A kicker or pure defender cannot be scored by the QB/RB/WR/TE rules,
+        # so they must not drag a profile lookup along with them.
+        found = seasonpool.athletes_from_boxscore(self.payload)
+        self.assertNotIn("9", found)
+        self.assertNotIn("8", found)
+
+    def test_player_in_two_categories_appears_once(self):
+        found = seasonpool.athletes_from_boxscore(self.payload)
+        self.assertEqual(found["1"], "A QB")
+        self.assertEqual(len(found), 4)
+
+    def test_empty_or_abandoned_game(self):
+        # A game called off before any snap (2022 BUF at CIN) has a schedule row
+        # but no box score. It must come back empty rather than raise.
+        self.assertEqual(seasonpool.athletes_from_boxscore({}), {})
+        self.assertEqual(seasonpool.athletes_from_boxscore({"boxscore": {"players": []}}), {})
+
+
+class TestSeasonEventSelection(unittest.TestCase):
+    def setUp(self) -> None:
+        self.conn = db.connect(":memory:")
+        db.init_db(self.conn)
+        db.upsert_games(
+            self.conn,
+            [
+                {"event_id": "a", "season": 2022, "season_type": 2, "week": 1,
+                 "score": "24-17", "is_all_star": 0},
+                {"event_id": "b", "season": 2022, "season_type": 2, "week": 2,
+                 "score": None, "is_all_star": 0},
+                {"event_id": "c", "season": 2022, "season_type": 3, "week": 1,
+                 "score": "31-3", "is_all_star": 0},
+                {"event_id": "d", "season": 2022, "season_type": 3, "week": 4,
+                 "score": "7-6", "is_all_star": 1},
+                {"event_id": "e", "season": 2021, "season_type": 2, "week": 1,
+                 "score": "10-9", "is_all_star": 0},
+            ],
+        )
+
+    def tearDown(self) -> None:
+        self.conn.close()
+
+    def test_regular_season_only_by_default(self):
+        self.assertEqual(seasonpool.season_event_ids(self.conn, 2022), ["a"])
+
+    def test_unplayed_games_excluded(self):
+        # No box score exists yet, so a season in progress is safe to scan.
+        self.assertNotIn("b", seasonpool.season_event_ids(self.conn, 2022))
+
+    def test_pro_bowl_excluded(self):
+        self.assertNotIn("d", seasonpool.season_event_ids(self.conn, 2022, season_type=3))
+
+    def test_season_is_respected(self):
+        self.assertEqual(seasonpool.season_event_ids(self.conn, 2021), ["e"])
+
+
+class TestSyncedSeasons(unittest.TestCase):
+    def setUp(self) -> None:
+        self.conn = db.connect(":memory:")
+        db.init_db(self.conn)
+
+    def tearDown(self) -> None:
+        self.conn.close()
+
+    def test_groups_seasons_by_athlete(self):
+        db.record_sync(self.conn, "1", 2021, 17)
+        db.record_sync(self.conn, "1", 2022, 16)
+        db.record_sync(self.conn, "2", 2022, 5)
+        self.assertEqual(
+            seasonpool._synced_seasons(self.conn), {"1": {2021, 2022}, "2": {2022}}
+        )
+
+    def test_a_season_with_no_games_still_counts_as_synced(self):
+        # Recording the zero is the point: we already asked ESPN and it had
+        # nothing, so a rerun must not pay for that lookup again.
+        db.record_sync(self.conn, "1", 2020, 0)
+        self.assertEqual(seasonpool._synced_seasons(self.conn), {"1": {2020}})
 
 
 if __name__ == "__main__":
