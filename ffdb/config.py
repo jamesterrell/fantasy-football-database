@@ -42,7 +42,24 @@ COMPETITOR_STATS_URL = (
 # The index endpoint caps page size at 1000 regardless of the limit you ask for.
 INDEX_PAGE_SIZE = 1000
 
-USER_AGENT = "Mozilla/5.0 (compatible; ffdb/0.1; personal research project)"
+# User-Agent, or None to let requests send its own default.
+#
+# ESPN's edge blocks this one on an allowlist rather than a blocklist: a UA it
+# recognises as a programmatic client passes, and anything else gets a 403
+# before the request reaches the API. Measured against the summary endpoint:
+#
+#     python-requests/2.33.1                        -> 200
+#     curl/8.0.1                                    -> 200
+#     Mozilla/5.0 (compatible; ffdb/0.1; ...)       -> 403
+#     Mozilla/5.0 (Windows NT 10.0; ... Chrome/124) -> 403
+#     ffdb/0.1 (personal research project)          -> 403
+#
+# So a browser-shaped string is worse than useless, and identifying the project
+# by name is not on the menu either - `ffdb/0.1` is blocked on its own. None it
+# is. This bit silently, because the box scores fetched before the rule changed
+# were already cached: the 2020-2024 backfill kept working from disk while a
+# fresh 2025 pull failed on every event.
+USER_AGENT = None
 
 # Politeness: seconds to sleep between live HTTP calls.
 REQUEST_DELAY = 0.5
