@@ -37,7 +37,13 @@ class ESPNClient:
         self.max_retries = max_retries
         self._last_request_at = 0.0
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": config.USER_AGENT, "Accept": "application/json"})
+        self.session.headers.update({"Accept": "application/json"})
+        # Only override the default when config asks for it. Assigning None into
+        # a Session's headers does not clear the header, it sends the literal
+        # string "None" - which is exactly the kind of unrecognised UA that
+        # earns a 403.
+        if config.USER_AGENT is not None:
+            self.session.headers["User-Agent"] = config.USER_AGENT
 
     # ---------------------------------------------------------------- caching
 
