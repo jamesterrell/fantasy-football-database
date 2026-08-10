@@ -218,6 +218,19 @@ CREATE TABLE IF NOT EXISTS rankings (
     PRIMARY KEY (season, scoring, athlete_id)
 );
 
+-- ESPN's own games-played count per athlete-season, from the season totals
+-- endpoint. It is a different pipeline from the game log and reads higher
+-- wherever the log is short, which makes it the honest denominator for a
+-- per-game average even when the missing rows cannot be recovered.
+-- Regular season only, matching what ESPN publishes there.
+CREATE TABLE IF NOT EXISTS athlete_seasons (
+    athlete_id    TEXT    NOT NULL REFERENCES athletes(athlete_id),
+    season        INTEGER NOT NULL,
+    games_played  INTEGER,
+    updated_at    TEXT,
+    PRIMARY KEY (athlete_id, season)
+);
+
 CREATE TABLE IF NOT EXISTS sync_log (
     athlete_id TEXT NOT NULL,
     season     INTEGER NOT NULL,
@@ -452,6 +465,18 @@ def replace_rankings(conn: sqlite3.Connection, season: int, scoring: str, rows: 
     return count
 
 
+def upsert_athlete_seasons(conn: sqlite3.Connection, rows: Iterable[dict]) -> int:
+    """Store ESPN's games-played count per athlete-season."""
+    count = 0
+    for row in rows:
+        record = dict(row)
+        record["updated_at"] = now_iso()
+        _upsert(conn, "athlete_seasons", record, ("athlete_id", "season"))
+        count += 1
+    conn.commit()
+    return count
+
+
 def record_sync(conn: sqlite3.Connection, athlete_id: str, season: int, games: int) -> None:
     _upsert(
         conn,
@@ -474,6 +499,11 @@ VIEWS = {
         JOIN athletes a ON a.athlete_id = pg.athlete_id
         WHERE pg.is_all_star = 0
     """,
+    # `games` counts rows; `games_played` is ESPN's own season figure. They agree
+    # almost everywhere, and where they don't the game log is short of rows - so
+    # `fp_ppr_per_game` (rows) reads high and `fp_ppr_per_game_played` (ESPN's
+    # count) is the one to trust. games_played is regular season only, so it is
+    # NULL on a postseason row rather than wrong.
     "v_player_seasons": """
         CREATE VIEW v_player_seasons AS
         SELECT
@@ -483,12 +513,19 @@ VIEWS = {
             pg.season,
             pg.season_type,
             COUNT(*)                          AS games,
+            CASE WHEN pg.season_type = 2 THEN s.games_played END
+                                              AS games_played,
             ROUND(SUM(pg.fp_ppr), 2)          AS fp_ppr_total,
             ROUND(AVG(pg.fp_ppr), 2)          AS fp_ppr_per_game,
+            CASE WHEN pg.season_type = 2 THEN
+                ROUND(SUM(pg.fp_ppr) / NULLIF(s.games_played, 0), 2) END
+                                              AS fp_ppr_per_game_played,
             ROUND(SUM(pg.fp_half_ppr), 2)     AS fp_half_ppr_total,
             ROUND(SUM(pg.fp_standard), 2)     AS fp_standard_total
         FROM player_games pg
         JOIN athletes a ON a.athlete_id = pg.athlete_id
+        LEFT JOIN athlete_seasons s
+               ON s.athlete_id = pg.athlete_id AND s.season = pg.season
         WHERE pg.is_all_star = 0
         GROUP BY pg.athlete_id, pg.season, pg.season_type
     """,

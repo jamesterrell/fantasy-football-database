@@ -41,6 +41,15 @@ ATHLETE_EVENTLOG_URL = (
 # page in practice; the loader still follows `pageCount` rather than assume it.
 EVENTLOG_PAGE_SIZE = 100
 
+# Season totals, including games played. This is a different pipeline from the
+# game log and disagrees with it where the game log is short, which makes it the
+# authority on how many games a player actually appeared in. One request returns
+# every season of a career. Regular season only - a 2021 Bengal reads 16 here
+# against 16 regular-season plus 4 postseason game-log rows.
+ATHLETE_STATS_URL = (
+    "https://site.web.api.espn.com/apis/common/v3/sports/football/nfl/athletes/{athlete_id}/stats"
+)
+
 # Team defense. The schedule supplies the season's events; the per-competitor
 # statistics endpoint supplies one team's full stat line for one of them.
 TEAM_SCHEDULE_URL = (

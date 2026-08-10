@@ -1296,6 +1296,127 @@ class TestAthleteSeasonSelection(unittest.TestCase):
         self.assertEqual(attendance.loaded_athlete_seasons(self.conn, [2020]), {})
 
 
+def make_season_stats(*rows: tuple[str, int, int]) -> dict:
+    """ESPN season-totals shape from (category, season, gamesPlayed) triples."""
+    cats: dict[str, list] = {}
+    for category, season, gp in rows:
+        cats.setdefault(category, []).append(
+            {"season": {"year": season}, "stats": [str(gp), "123"]}
+        )
+    return {
+        "categories": [
+            {"name": name, "names": ["gamesPlayed", "someYards"], "statistics": entries}
+            for name, entries in cats.items()
+        ]
+    }
+
+
+class TestGamesPlayed(unittest.TestCase):
+    def test_read_per_season(self):
+        payload = make_season_stats(("rushing", 2021, 17), ("rushing", 2020, 15))
+        self.assertEqual(attendance.games_played(payload), {2021: 17, 2020: 15})
+
+    def test_categories_disagreeing_take_the_larger(self):
+        # A player who rushed in 6 games and returned kicks in 11 appeared in 11;
+        # the smaller figure is the games that category applied to, not the total.
+        payload = make_season_stats(("rushing", 2021, 6), ("receiving", 2021, 11))
+        self.assertEqual(attendance.games_played(payload), {2021: 11})
+
+    def test_category_without_games_played_ignored(self):
+        payload = {"categories": [{"name": "x", "names": ["yards"], "statistics": [
+            {"season": {"year": 2021}, "stats": ["500"]}]}]}
+        self.assertEqual(attendance.games_played(payload), {})
+
+    def test_non_numeric_and_empty(self):
+        payload = make_season_stats(("rushing", 2021, 12))
+        payload["categories"][0]["statistics"].append({"season": {"year": 2022}, "stats": ["-"]})
+        self.assertEqual(attendance.games_played(payload), {2021: 12})
+        self.assertEqual(attendance.games_played({}), {})
+
+
+class TestForcedAssignment(unittest.TestCase):
+    @staticmethod
+    def _c(n):
+        return [{"event_id": str(i)} for i in range(n)]
+
+    def test_exactly_as_many_candidates_as_missing_is_forced(self):
+        cands = self._c(3)
+        self.assertEqual(attendance.forced_assignment(3, cands), cands)
+
+    def test_more_candidates_than_missing_is_refused(self):
+        # Picking 2 of 5 would be inventing which weeks the player was on the
+        # field, which is worse than leaving the rows absent.
+        self.assertIsNone(attendance.forced_assignment(2, self._c(5)))
+
+    def test_fewer_candidates_than_missing_is_refused(self):
+        self.assertIsNone(attendance.forced_assignment(4, self._c(2)))
+
+    def test_nothing_missing(self):
+        self.assertIsNone(attendance.forced_assignment(0, self._c(0)))
+        self.assertIsNone(attendance.forced_assignment(-1, self._c(1)))
+
+
+class TestPlayerSeasonsGamesPlayed(unittest.TestCase):
+    def setUp(self) -> None:
+        self.conn = db.connect(":memory:")
+        db.init_db(self.conn)
+        db.upsert_athlete(self.conn, {"athlete_id": "1", "display_name": "Short Season"})
+        db.upsert_games(self.conn, [
+            {"event_id": "a", "season": 2021, "season_type": 2, "is_all_star": 0},
+            {"event_id": "b", "season": 2021, "season_type": 2, "is_all_star": 0},
+            {"event_id": "p", "season": 2021, "season_type": 3, "is_all_star": 0},
+        ])
+        db.upsert_player_games(self.conn, [
+            {"athlete_id": "1", "event_id": "a", "season": 2021, "season_type": 2,
+             "is_all_star": 0, "fp_ppr": 10.0, "_stats": {}},
+            {"athlete_id": "1", "event_id": "b", "season": 2021, "season_type": 2,
+             "is_all_star": 0, "fp_ppr": 20.0, "_stats": {}},
+            {"athlete_id": "1", "event_id": "p", "season": 2021, "season_type": 3,
+             "is_all_star": 0, "fp_ppr": 6.0, "_stats": {}},
+        ])
+        db.upsert_athlete_seasons(self.conn, [
+            {"athlete_id": "1", "season": 2021, "games_played": 3}
+        ])
+        db.rebuild_views(self.conn)
+
+    def tearDown(self) -> None:
+        self.conn.close()
+
+    def _row(self, season_type):
+        return self.conn.execute(
+            "SELECT * FROM v_player_seasons WHERE athlete_id='1' AND season_type=?",
+            (season_type,),
+        ).fetchone()
+
+    def test_both_denominators_are_exposed(self):
+        row = self._row(2)
+        self.assertEqual((row["games"], row["games_played"]), (2, 3))
+
+    def test_the_espn_denominator_gives_the_lower_average(self):
+        # 30 points over 2 stored rows reads 15.0; over the 3 games ESPN counts
+        # it is 10.0, and the third game is the missing scoreless one.
+        row = self._row(2)
+        self.assertEqual(row["fp_ppr_per_game"], 15.0)
+        self.assertEqual(row["fp_ppr_per_game_played"], 10.0)
+
+    def test_postseason_row_gets_no_games_played(self):
+        # ESPN's figure is regular season only, so applying it here would be wrong.
+        row = self._row(3)
+        self.assertIsNone(row["games_played"])
+        self.assertIsNone(row["fp_ppr_per_game_played"])
+
+    def test_an_athlete_season_with_no_figure_still_reports_rows(self):
+        db.upsert_athlete(self.conn, {"athlete_id": "2", "display_name": "No Figure"})
+        db.upsert_player_games(self.conn, [
+            {"athlete_id": "2", "event_id": "a", "season": 2021, "season_type": 2,
+             "is_all_star": 0, "fp_ppr": 5.0, "_stats": {}}])
+        db.rebuild_views(self.conn)
+        row = self.conn.execute(
+            "SELECT * FROM v_player_seasons WHERE athlete_id='2'").fetchone()
+        self.assertEqual(row["games"], 1)
+        self.assertIsNone(row["games_played"])
+
+
 class TestGameIndex(unittest.TestCase):
     def setUp(self) -> None:
         self.conn = db.connect(":memory:")

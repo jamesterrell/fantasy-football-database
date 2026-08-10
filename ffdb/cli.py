@@ -221,6 +221,45 @@ def cmd_attendance(args: argparse.Namespace) -> int:
             "with their real numbers",
             file=sys.stderr,
         )
+
+    if args.skip_games_played:
+        conn.close()
+        return 0
+
+    gp = attendance.fill_from_games_played(
+        conn, _client(args), seasons=_season_range(args.season),
+        dry_run=args.dry_run, force=args.force,
+    )
+    print(
+        f"\nseason totals read for {gp['athletes']} athletes"
+        + (f" ({gp['no_stats']} unavailable)" if gp["no_stats"] else "")
+        + f"; games-played recorded for {gp['seasons_recorded']} athlete-seasons"
+    )
+    header = f"{'SEASON':<8}{'ROWS SHORT OF GP':>18}{'FORCED':>8}{'AMBIGUOUS':>11}"
+    print("\n" + header)
+    print("-" * len(header))
+    for season, counts in sorted(gp["per_season"].items()):
+        print(
+            f"{season:<8}{counts['missing']:>18}{counts['forced']:>8}{counts['ambiguous']:>11}"
+        )
+    print(
+        f"\n{gp['missing_rows']} rows short of ESPN's games-played across "
+        f"{gp['short_seasons']} athlete-seasons"
+    )
+    print(
+        f"{verb} {gp['filled']} of them - the ones with only one possible assignment; "
+        f"{gp['ambiguous']} could be any of several weeks and were left absent"
+    )
+    if gp["impossible"]:
+        print(
+            f"{gp['impossible']} had fewer candidate games than games played, which should "
+            "not happen - check them",
+            file=sys.stderr,
+        )
+    print(
+        "the ambiguous ones are still counted: v_player_seasons.games_played holds ESPN's "
+        "figure, so fp_ppr_per_game_played is right even where the rows are not there"
+    )
     conn.close()
     return 0
 
@@ -415,6 +454,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_att.add_argument(
         "--dry-run", action="store_true",
         help="classify the gaps and report, without fetching stat lines or writing",
+    )
+    p_att.add_argument(
+        "--skip-games-played", action="store_true",
+        help="event-log pass only; skip the season games-played comparison",
     )
     p_att.add_argument("--force", action="store_true", help="ignore the raw JSON archive")
     p_att.set_defaults(func=cmd_attendance)
