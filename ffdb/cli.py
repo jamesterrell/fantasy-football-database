@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from . import athletes as athletes_mod
-from . import config, db, pipeline, ranking, scoring, seasonpool
+from . import attendance, config, db, pipeline, ranking, scoring, seasonpool
 from .espn import ESPNClient
 
 
@@ -185,6 +185,44 @@ def cmd_build_season(args: argparse.Namespace) -> int:
             print(f"{r['season']:<8}{r['players']:>9}{r['games']:>8}")
     conn.close()
     return 1 if result["failed"] else 0
+
+
+def cmd_attendance(args: argparse.Namespace) -> int:
+    conn = db.connect(args.db)
+    db.init_db(conn)
+    result = attendance.fill_seasons(
+        conn, _client(args), seasons=_season_range(args.season),
+        dry_run=args.dry_run, force=args.force,
+    )
+
+    verb = "would fill" if args.dry_run else "filled"
+    print(
+        f"\nchecked {result['athlete_seasons']} athlete-seasons across {result['seasons']}"
+        + (f" ({result['eventlog_missing']} had no event log)" if result["eventlog_missing"] else "")
+    )
+    header = f"{'SEASON':<8}{'PLAYED, UNLOGGED':>18}{'INACTIVE':>10}{'FILLED':>8}{'NOT ZERO':>10}"
+    print("\n" + header)
+    print("-" * len(header))
+    for season, counts in sorted(result["per_season"].items()):
+        print(
+            f"{season:<8}{counts['fillable']:>18}{counts['inactive']:>10}"
+            f"{counts['filled']:>8}{counts['scoring']:>10}"
+        )
+    print(
+        f"\n{result['fillable']} games played but unlogged, {result['inactive']} rostered but "
+        f"inactive (left absent), {result['unknown_event']} events not in `games`"
+    )
+    print(f"{verb} {result['filled']} rows")
+    if result["no_stat_line"]:
+        print(f"{result['no_stat_line']} filled with zeros - ESPN served no stat line for them")
+    if result["not_actually_scoreless"]:
+        print(
+            f"{result['not_actually_scoreless']} were not scoreless after all and were stored "
+            "with their real numbers",
+            file=sys.stderr,
+        )
+    conn.close()
+    return 0
 
 
 def cmd_rankings(args: argparse.Namespace) -> int:
@@ -365,6 +403,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_season.add_argument("--force", action="store_true", help="ignore the raw JSON archive")
     p_season.set_defaults(func=cmd_build_season)
+
+    p_att = sub.add_parser(
+        "attendance",
+        help="recover games a player was active for that ESPN's game log omits",
+    )
+    p_att.add_argument(
+        "--season", action="append", required=True,
+        help="season or range, e.g. --season 2016-2025 (repeatable)",
+    )
+    p_att.add_argument(
+        "--dry-run", action="store_true",
+        help="classify the gaps and report, without fetching stat lines or writing",
+    )
+    p_att.add_argument("--force", action="store_true", help="ignore the raw JSON archive")
+    p_att.set_defaults(func=cmd_attendance)
 
     p_rank = sub.add_parser("rankings", help="show a stored ranking")
     p_rank.add_argument("--season", type=int, required=True)

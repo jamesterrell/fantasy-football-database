@@ -42,6 +42,7 @@ PLAYER_GAME_FIXED_COLUMNS = (
     "fp_half_ppr",
     "fp_ppr",
     "raw_stats",
+    "source",
     "loaded_at",
 )
 
@@ -144,6 +145,11 @@ CREATE TABLE IF NOT EXISTS player_games (
     fp_half_ppr    REAL,
     fp_ppr         REAL,
     raw_stats      TEXT,
+    -- Which ESPN endpoint the row came from. 'gamelog' is the athlete game log,
+    -- the normal path. 'eventlog' is a game the game log leaves out entirely,
+    -- recovered from the event log because it says the athlete played it - see
+    -- ffdb/attendance.py. Filter on it if you want only ESPN's own rows.
+    source         TEXT DEFAULT 'gamelog',
     loaded_at      TEXT,
     PRIMARY KEY (athlete_id, event_id)
 );
@@ -261,7 +267,9 @@ def connect(db_path: Path | str = config.DB_PATH) -> sqlite3.Connection:
 # databases pick them up without being rebuilt.
 MIGRATIONS: dict[str, dict[str, str]] = {
     "games": {"is_all_star": "INTEGER DEFAULT 0"},
-    "player_games": {"is_all_star": "INTEGER DEFAULT 0"},
+    # A constant DEFAULT is what existing rows read back as, so the rows loaded
+    # before this column existed correctly report themselves as game-log rows.
+    "player_games": {"is_all_star": "INTEGER DEFAULT 0", "source": "TEXT DEFAULT 'gamelog'"},
 }
 
 
@@ -504,12 +512,20 @@ VIEWS = {
     # Two stats ESPN publishes are deliberately left out, because it zero-fills
     # them rather than omitting them, and a 0 averages in as a real low:
     #
-    #   plays_allowed        0 in 446 of 2020's 512 games
+    #   plays_allowed        0 in 446 of 2020's 512 games, and worse before that
     #   redzone_tds_allowed  0 in every game, all seasons
     #
     # Both are still on `team_defense_games` if you want to handle them yourself.
     # `redzone_att_allowed_pg` below is unaffected - red-zone trips faced are real,
     # it is only what happened inside the 20 that is missing.
+    #
+    # `turnovers_forced` and `takeaways` are the same story told a different way:
+    # ESPN only began publishing `totalGiveaways`/`totalTakeaways` in 2021, and
+    # before that the key is simply absent from all but 34-66 games a season. The
+    # column is NULL there rather than zero, so AVG() would quietly report the
+    # mean of two games per team as if it were the season. Both averages are
+    # therefore guarded on every game in the season having a value, which yields
+    # a real number from 2021 on and NULL before it.
     "v_team_defense_seasons": """
         CREATE VIEW v_team_defense_seasons AS
         SELECT
@@ -530,8 +546,11 @@ VIEWS = {
             ROUND(AVG(td.rush_tds_allowed), 2)            AS rush_tds_allowed_pg,
             ROUND(AVG(td.tds_allowed), 2)                 AS tds_allowed_pg,
             ROUND(AVG(td.possession_seconds_allowed), 2)  AS possession_seconds_allowed_pg,
-            ROUND(AVG(td.turnovers_forced), 2)            AS turnovers_forced_pg,
-            ROUND(AVG(td.takeaways), 2)                   AS takeaways_pg,
+            CASE WHEN COUNT(td.turnovers_forced) = COUNT(*)
+                 THEN ROUND(AVG(td.turnovers_forced), 2) END
+                                                          AS turnovers_forced_pg,
+            CASE WHEN COUNT(td.takeaways) = COUNT(*)
+                 THEN ROUND(AVG(td.takeaways), 2) END     AS takeaways_pg,
             ROUND(AVG(td.fumbles_recovered), 2)           AS fumbles_recovered_pg,
             ROUND(AVG(td.sacks), 2)                       AS sacks_pg,
             ROUND(AVG(td.interceptions), 2)               AS interceptions_pg,

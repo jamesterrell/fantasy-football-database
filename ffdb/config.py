@@ -29,6 +29,18 @@ ROSTER_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/{
 # summary endpoint lists every athlete who recorded a stat in one event.
 SUMMARY_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/summary"
 
+# Attendance. The game log only carries games the athlete has a stat line for,
+# so a game they played and recorded nothing in is indistinguishable there from
+# a game they sat out. The event log carries both, each flagged `played`, which
+# is what separates "scoreless" from "inactive" from "not on the roster".
+ATHLETE_EVENTLOG_URL = (
+    "https://sports.core.api.espn.com/v2/sports/football/leagues/nfl/seasons/{season}"
+    "/athletes/{athlete_id}/eventlog"
+)
+# Page size for the event log. A season is at most ~21 events, so this is one
+# page in practice; the loader still follows `pageCount` rather than assume it.
+EVENTLOG_PAGE_SIZE = 100
+
 # Team defense. The schedule supplies the season's events; the per-competitor
 # statistics endpoint supplies one team's full stat line for one of them.
 TEAM_SCHEDULE_URL = (

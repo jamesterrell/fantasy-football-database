@@ -174,6 +174,10 @@ def parse_gamelog(athlete_id: str, season: int, payload: dict) -> tuple[list[dic
                     "opponent_score": opp_score,
                     "is_all_star": is_all_star,
                     "raw_stats": json.dumps(raw_stats),
+                    # Set explicitly rather than left to the column default, so
+                    # that a game first recovered from the event log is demoted
+                    # back to a plain game-log row if ESPN later serves one.
+                    "source": "gamelog",
                     "_stats": {k: _to_number(v) for k, v in raw_stats.items()},
                 }
                 player_games.append(row)

@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ffdb import (  # noqa: E402
     athletes,
+    attendance,
     db,
     gamelog,
     ranking,
@@ -521,7 +522,7 @@ class TestTeamDefenseSeasonsView(unittest.TestCase):
     @staticmethod
     def _game(
         event_id, week, points, plays, season_type=2, is_all_star=0,
-        third_att=10, third_conv=5,
+        third_att=10, third_conv=5, turnovers=1.0,
     ) -> dict:
         return {
             "team_id": "12", "event_id": event_id, "season": 2025,
@@ -530,6 +531,8 @@ class TestTeamDefenseSeasonsView(unittest.TestCase):
             "plays_allowed": float(plays),
             "third_down_att_allowed": float(third_att),
             "third_down_conv_allowed": float(third_conv),
+            "turnovers_forced": turnovers,
+            "takeaways": turnovers,
             "_stats": {"sacks": 2.0},
         }
 
@@ -567,6 +570,26 @@ class TestTeamDefenseSeasonsView(unittest.TestCase):
             self.assertNotIn(excluded, columns)
         # Red-zone trips faced are real, and stay.
         self.assertIn("redzone_att_allowed_pg", columns)
+
+    def test_turnovers_average_over_a_complete_season(self):
+        self.assertEqual(self._row()["turnovers_forced_pg"], 1.0)
+        self.assertEqual(self._row()["takeaways_pg"], 1.0)
+
+    def test_turnovers_are_withheld_when_a_game_has_no_value(self):
+        # ESPN only started publishing totalGiveaways/totalTakeaways in 2021;
+        # before that the key is absent from all but a few dozen games a season.
+        # Averaging the handful that have one reports two games as if they were
+        # the season, so the average is withheld unless every game backs it.
+        db.upsert_games(self.conn, [{"event_id": "5", "season": 2025}])
+        db.upsert_team_defense_games(
+            self.conn, [self._game("5", week=3, points=10, plays=55, turnovers=None)]
+        )
+        db.rebuild_views(self.conn)
+        row = self._row()
+        self.assertEqual(row["games"], 3)
+        self.assertIsNotNone(row["points_allowed_pg"])   # unaffected columns still average
+        self.assertIsNone(row["turnovers_forced_pg"])
+        self.assertIsNone(row["takeaways_pg"])
 
 
 class TestTeamScheduleView(unittest.TestCase):
@@ -980,6 +1003,321 @@ class TestSyncedSeasons(unittest.TestCase):
         # nothing, so a rerun must not pay for that lookup again.
         db.record_sync(self.conn, "1", 2020, 0)
         self.assertEqual(seasonpool._synced_seasons(self.conn), {"1": {2020}})
+
+
+def make_eventlog(*events: tuple[str, str, bool]) -> dict:
+    """ESPN's event-log shape from (event_id, team_id, played) triples."""
+    return {
+        "events": {
+            "count": len(events),
+            "pageCount": 1,
+            "items": [
+                {
+                    "event": {
+                        "$ref": f"http://sports.core.api.espn.com/v2/sports/football/leagues/"
+                                f"nfl/events/{event_id}?lang=en&region=us"
+                    },
+                    "statistics": {
+                        "$ref": f"http://sports.core.api.espn.com/v2/sports/football/leagues/nfl/"
+                                f"events/{event_id}/competitions/{event_id}/competitors/"
+                                f"{team_id}/roster/1/statistics/0?lang=en&region=us"
+                    },
+                    "teamId": team_id,
+                    "played": played,
+                }
+                for event_id, team_id, played in events
+            ],
+        }
+    }
+
+
+class TestEventlogParsing(unittest.TestCase):
+    def test_event_id_pulled_out_of_the_ref(self):
+        entries = attendance.parse_eventlog(make_eventlog(("401326318", "11", True)))
+        self.assertEqual(entries[0]["event_id"], "401326318")
+        self.assertEqual(entries[0]["team_id"], "11")
+        self.assertTrue(entries[0]["played"])
+
+    def test_played_flag_is_kept_false(self):
+        # The false rows are the whole point: they are what stops an inactive
+        # week being filled in as a scoreless one.
+        entries = attendance.parse_eventlog(make_eventlog(("1", "11", False)))
+        self.assertFalse(entries[0]["played"])
+
+    def test_duplicate_events_collapse(self):
+        entries = attendance.parse_eventlog(make_eventlog(("1", "11", True), ("1", "11", True)))
+        self.assertEqual(len(entries), 1)
+
+    def test_empty_payload(self):
+        self.assertEqual(attendance.parse_eventlog({}), [])
+
+    def test_unparseable_ref_skipped(self):
+        payload = {"events": {"items": [{"event": {"$ref": "nonsense"}, "teamId": "11"}]}}
+        self.assertEqual(attendance.parse_eventlog(payload), [])
+
+
+class TestEventStatsParsing(unittest.TestCase):
+    def test_categories_flatten_to_one_mapping(self):
+        payload = {
+            "splits": {
+                "categories": [
+                    {"name": "rushing", "stats": [
+                        {"name": "rushingYards", "value": 12.0},
+                        {"name": "rushingTouchdowns", "value": 0.0},
+                    ]},
+                    {"name": "receiving", "stats": [{"name": "receptions", "value": 2.0}]},
+                ]
+            }
+        }
+        self.assertEqual(
+            attendance.parse_event_stats(payload),
+            {"rushingYards": 12.0, "rushingTouchdowns": 0.0, "receptions": 2.0},
+        )
+
+    def test_repeated_key_takes_the_first_occurrence(self):
+        # `fumbles` is published under general, rushing and receiving alike; the
+        # game log has one column for it, so the recovered row gets one value.
+        payload = {"splits": {"categories": [
+            {"name": "general", "stats": [{"name": "fumbles", "value": 1.0}]},
+            {"name": "rushing", "stats": [{"name": "fumbles", "value": 0.0}]},
+        ]}}
+        self.assertEqual(attendance.parse_event_stats(payload), {"fumbles": 1.0})
+
+    def test_non_numeric_value_becomes_null(self):
+        payload = {"splits": {"categories": [
+            {"name": "general", "stats": [{"name": "rushingYards", "value": "--"}]},
+        ]}}
+        self.assertIsNone(attendance.parse_event_stats(payload)["rushingYards"])
+
+    def test_missing_splits(self):
+        self.assertEqual(attendance.parse_event_stats({"error": "not found"}), {})
+
+
+class TestGapClassification(unittest.TestCase):
+    def setUp(self) -> None:
+        self.conn = db.connect(":memory:")
+        db.init_db(self.conn)
+        db.upsert_games(
+            self.conn,
+            [
+                {"event_id": "1", "season": 2021, "season_type": 2, "week": 1,
+                 "home_team_id": "11", "away_team_id": "26", "home_score": 16.0,
+                 "away_score": 28.0, "score": "28-16", "is_all_star": 0},
+                {"event_id": "2", "season": 2021, "season_type": 2, "week": 2,
+                 "home_team_id": "26", "away_team_id": "11", "home_score": 3.0,
+                 "away_score": 31.0, "score": "31-3", "is_all_star": 0},
+                {"event_id": "3", "season": 2021, "season_type": 2, "week": 3,
+                 "home_team_id": "11", "away_team_id": "10", "home_score": 7.0,
+                 "away_score": 7.0, "score": "7-7", "is_all_star": 0},
+            ],
+        )
+        self.games = attendance._game_index(self.conn, [2021])
+
+    def tearDown(self) -> None:
+        self.conn.close()
+
+    def test_played_and_unlogged_is_fillable(self):
+        split = attendance.classify(
+            attendance.parse_eventlog(make_eventlog(("1", "11", True))), set(), self.games
+        )
+        self.assertEqual([e["event_id"] for e in split["fillable"]], ["1"])
+
+    def test_inactive_is_never_filled(self):
+        split = attendance.classify(
+            attendance.parse_eventlog(make_eventlog(("1", "11", False))), set(), self.games
+        )
+        self.assertEqual(split["fillable"], [])
+        self.assertEqual([e["event_id"] for e in split["inactive"]], ["1"])
+
+    def test_a_game_already_stored_is_not_a_gap(self):
+        split = attendance.classify(
+            attendance.parse_eventlog(make_eventlog(("1", "11", True))), {"1"}, self.games
+        )
+        self.assertEqual(split["fillable"], [])
+
+    def test_event_outside_games_is_not_invented(self):
+        # Preseason events show up in the event log and have no row in `games`.
+        split = attendance.classify(
+            attendance.parse_eventlog(make_eventlog(("77", "11", True))), set(), self.games
+        )
+        self.assertEqual(split["fillable"], [])
+        self.assertEqual([e["event_id"] for e in split["unknown_event"]], ["77"])
+
+    def test_a_week_off_the_roster_never_reaches_the_classifier(self):
+        # Event 2 was played by the athlete's team but is absent from their
+        # event log - they were not on the roster - so no case covers it and
+        # no row is produced. This is the one a naive team-schedule diff fills.
+        split = attendance.classify(
+            attendance.parse_eventlog(make_eventlog(("1", "11", True))), set(), self.games
+        )
+        filled = {e["event_id"] for group in split.values() for e in group}
+        self.assertNotIn("2", filled)
+
+
+class TestRecoveredRow(unittest.TestCase):
+    def setUp(self) -> None:
+        self.conn = db.connect(":memory:")
+        db.init_db(self.conn)
+        db.upsert_teams(self.conn, [
+            {"team_id": "11", "abbreviation": "IND"},
+            {"team_id": "26", "abbreviation": "SEA"},
+        ])
+        db.upsert_games(self.conn, [
+            {"event_id": "1", "season": 2021, "season_type": 2, "week": 1,
+             "game_date": "2021-09-12T17:00:00.000+00:00", "home_team_id": "11",
+             "away_team_id": "26", "home_score": 16.0, "away_score": 28.0,
+             "score": "28-16", "is_all_star": 0},
+        ])
+        self.game = attendance._game_index(self.conn, [2021])["1"]
+
+    def tearDown(self) -> None:
+        self.conn.close()
+
+    def test_a_team_that_did_not_play_this_game_is_refused(self):
+        # Every side-dependent field below reads off which team it was, so
+        # guessing one would silently mislabel opponent, venue and result.
+        with self.assertRaises(ValueError):
+            attendance.build_row("9", self.game, "99", {}, set())
+        with self.assertRaises(ValueError):
+            attendance.build_row("9", self.game, None, {}, set())
+
+    def test_abbreviations_are_filled_in(self):
+        row = attendance.build_row("9", self.game, "11", {}, set(), {"11": "IND", "26": "SEA"})
+        self.assertEqual((row["team_abbr"], row["opponent_abbr"]), ("IND", "SEA"))
+
+    def test_home_side_and_loss(self):
+        row = attendance.build_row("9", self.game, "11", {}, set())
+        self.assertEqual(row["home_away"], "home")
+        self.assertEqual(row["opponent_id"], "26")
+        self.assertEqual((row["team_score"], row["opponent_score"]), (16.0, 28.0))
+        self.assertEqual(row["result"], "L")
+
+    def test_away_side_flips_everything(self):
+        row = attendance.build_row("9", self.game, "26", {}, set())
+        self.assertEqual(row["home_away"], "away")
+        self.assertEqual(row["opponent_id"], "11")
+        self.assertEqual((row["team_score"], row["opponent_score"]), (28.0, 16.0))
+        self.assertEqual(row["result"], "W")
+
+    def test_marked_as_recovered(self):
+        row = attendance.build_row("9", self.game, "11", {}, set())
+        self.assertEqual(row["source"], "eventlog")
+
+    def test_game_date_trimmed_to_a_day(self):
+        row = attendance.build_row("9", self.game, "11", {}, set())
+        self.assertEqual(row["game_date"], "2021-09-12")
+
+    def test_only_known_stat_keys_reach_their_own_column(self):
+        stats = {"rushingYards": 0.0, "ESPNRBRating": 41.2, "teamGamesPlayed": 1.0}
+        row = attendance.build_row("9", self.game, "11", stats, {"rushingYards"})
+        self.assertEqual(row["_stats"], {"rushingYards": 0.0})
+
+    def test_the_full_line_survives_in_raw_stats(self):
+        stats = {"rushingYards": 0.0, "ESPNRBRating": 41.2}
+        row = attendance.build_row("9", self.game, "11", stats, {"rushingYards"})
+        self.assertEqual(json.loads(row["raw_stats"]), stats)
+
+    def test_a_scoreless_line_scores_zero(self):
+        stats = {"rushingAttempts": 1.0, "rushingYards": 0.0, "receptions": 0.0}
+        row = attendance.build_row("9", self.game, "11", stats, set(stats))
+        row.update(scoring.all_formats(row["_stats"]))
+        self.assertEqual((row["fp_standard"], row["fp_half_ppr"], row["fp_ppr"]), (0.0, 0.0, 0.0))
+
+    def test_it_stores_a_real_line_rather_than_a_false_zero(self):
+        # The premise is that ESPN only omits games worth nothing. Where that
+        # is wrong the row must carry the numbers that happened.
+        stats = {"receptions": 2.0, "receivingYards": 31.0}
+        row = attendance.build_row("9", self.game, "11", stats, set(stats))
+        row.update(scoring.all_formats(row["_stats"]))
+        self.assertEqual(row["fp_ppr"], 5.1)
+
+    def test_it_stores_and_reads_back(self):
+        db.upsert_athlete(self.conn, {"athlete_id": "9", "display_name": "Test Player"})
+        row = attendance.build_row("9", self.game, "11", {"rushingYards": 0.0}, {"rushingYards"})
+        row.update(scoring.all_formats(row["_stats"]))
+        db.upsert_player_games(self.conn, [row])
+        db.rebuild_views(self.conn)
+        stored = self.conn.execute("SELECT * FROM v_player_games").fetchall()
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]["source"], "eventlog")
+        self.assertEqual(stored[0]["rushingYards"], 0.0)
+
+    def test_a_later_game_log_row_takes_the_source_back(self):
+        # If ESPN starts serving the game log for a game we recovered, the row
+        # must stop claiming to be recovered.
+        db.upsert_athlete(self.conn, {"athlete_id": "9", "display_name": "Test Player"})
+        row = attendance.build_row("9", self.game, "11", {"rushingYards": 0.0}, {"rushingYards"})
+        row.update(scoring.all_formats(row["_stats"]))
+        db.upsert_player_games(self.conn, [row])
+        _, real = gamelog.parse_gamelog("9", 2021, make_payload())
+        for r in real:
+            r["event_id"] = "1"
+            r.update(scoring.all_formats(r["_stats"]))
+            break
+        db.upsert_player_games(self.conn, real[:1])
+        source = self.conn.execute(
+            "SELECT source FROM player_games WHERE athlete_id = '9'"
+        ).fetchone()["source"]
+        self.assertEqual(source, "gamelog")
+
+
+class TestAthleteSeasonSelection(unittest.TestCase):
+    def setUp(self) -> None:
+        self.conn = db.connect(":memory:")
+        db.init_db(self.conn)
+        db.upsert_athlete(self.conn, {"athlete_id": "1", "display_name": "Has Rows"})
+        db.upsert_games(self.conn, [
+            {"event_id": "1", "season": 2021, "season_type": 2, "week": 1,
+             "home_team_id": "11", "away_team_id": "26", "score": "28-16", "is_all_star": 0},
+            {"event_id": "9", "season": 2021, "season_type": 3, "week": 4,
+             "home_team_id": "31", "away_team_id": "32", "score": "41-35", "is_all_star": 1},
+        ])
+        db.upsert_player_games(self.conn, [
+            {"athlete_id": "1", "event_id": "1", "season": 2021, "is_all_star": 0, "_stats": {}},
+            {"athlete_id": "1", "event_id": "9", "season": 2021, "is_all_star": 1, "_stats": {}},
+        ])
+        db.record_sync(self.conn, "2", 2021, 0)
+
+    def tearDown(self) -> None:
+        self.conn.close()
+
+    def test_an_athlete_season_with_rows_is_checked(self):
+        self.assertEqual(
+            attendance.loaded_athlete_seasons(self.conn, [2021]), {("1", 2021): {"1"}}
+        )
+
+    def test_an_athlete_season_with_no_rows_at_all_is_left_alone(self):
+        # ESPN serves an empty game log for some athletes entirely. Filling a
+        # whole season of zeros for them would manufacture a career out of an
+        # upstream outage, so they are not candidates.
+        self.assertNotIn(("2", 2021), attendance.loaded_athlete_seasons(self.conn, [2021]))
+
+    def test_other_seasons_are_out_of_scope(self):
+        self.assertEqual(attendance.loaded_athlete_seasons(self.conn, [2020]), {})
+
+
+class TestGameIndex(unittest.TestCase):
+    def setUp(self) -> None:
+        self.conn = db.connect(":memory:")
+        db.init_db(self.conn)
+        db.upsert_games(self.conn, [
+            {"event_id": "played", "season": 2021, "season_type": 2, "score": "3-0",
+             "is_all_star": 0},
+            {"event_id": "upcoming", "season": 2021, "season_type": 2, "score": None,
+             "is_all_star": 0},
+            {"event_id": "probowl", "season": 2021, "season_type": 3, "score": "41-35",
+             "is_all_star": 1},
+            {"event_id": "postseason", "season": 2021, "season_type": 3, "score": "27-24",
+             "is_all_star": 0},
+        ])
+
+    def tearDown(self) -> None:
+        self.conn.close()
+
+    def test_unplayed_and_exhibition_games_are_out_of_scope(self):
+        self.assertEqual(
+            set(attendance._game_index(self.conn, [2021])), {"played", "postseason"}
+        )
 
 
 if __name__ == "__main__":
