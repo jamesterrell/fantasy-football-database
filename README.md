@@ -3,16 +3,18 @@
 Game-level career data for NFL fantasy-relevant players, built from ESPN's public
 APIs into a local SQLite database, for use as a modelling dataset.
 
-Currently holds **17,285 player-games across 545 players and 2,953 distinct NFL
-games, spanning 2005-2025** — the full careers of the top 200 fantasy scorers of
-2025, plus the 2025 season for every other rostered skill-position player.
+Currently holds **64,180 player-games across 1,657 players and 3,215 distinct NFL
+games, spanning 2005-2025** — every fantasy-position player who appeared in a game
+from 2016 on, plus the earlier careers of the top 200 fantasy scorers of 2025.
 
-Note the shape of that: 2025 is broad (543 players), while earlier seasons narrow
-to the top-200's careers only (170 players in 2024, 66 in 2020, 3 in 2010). It is
-deliberately **not a balanced panel** — the further back you go, the more it is
-conditioned on being good enough to still be playing in 2025. That survivorship is
-fine for "how does this player score" and misleading for "how do players in general
-age", so pick your training window accordingly.
+**2016 onward is a complete panel**: 508-608 players and 5,700-6,800 player-games
+per season, enumerated from box scores rather than rosters, so players who have
+since retired, been cut or been hurt are all in it. Before 2016 it thins out fast
+(7 players in 2015, 3 in 2010), because those rows exist only as the back end of a
+2025 star's career and are therefore conditioned on being good enough to still be
+playing in 2025. That survivorship is fine for "how does this player score" and
+misleading for "how do players in general age", so start a training window at 2016
+unless you have a reason not to.
 
 ## Quick start
 
@@ -28,6 +30,8 @@ python -m ffdb export                     # v_player_games -> data/exports/
 Other commands:
 
 ```bash
+python -m ffdb build-season --season 2016-2025    # everyone who appeared, from box scores
+python -m ffdb attendance --season 2016-2025      # games the game log leaves out
 python -m ffdb build-top --season 2025 --top 200  # derive the top 200 and load their careers
 python -m ffdb rankings --season 2025 --top 50    # show a stored ranking
 python -m ffdb defense --season 2024              # team defense game logs, all 32 teams
@@ -36,7 +40,7 @@ python -m ffdb schedule --season 2026             # a season's matchups, upcomin
 python -m ffdb add "Josh Allen" "Ja'Marr Chase"   # batch; one failure won't abort the run
 python -m ffdb add 4242335 --season 2025 --force  # by id, one season, bypass the cache
 python -m ffdb index --search "Justin Tucker"     # look up ESPN athlete ids
-python -m unittest discover -s tests              # 63 tests, no network needed
+python -m unittest discover -s tests              # 105 tests, no network needed
 ```
 
 `--force` re-fetches from ESPN instead of reading the local archive. Use it for the
@@ -58,7 +62,11 @@ ESPN athlete index  ->  athlete_id  ->  gamelog per season  ->  parse  ->  SQLit
    returns one JSON document per athlete-season, with a `names[]` array that is
    index-aligned to each event's `stats[]`. The seasons a player has are read from
    the payload's own `filters` block, so career span is discovered, never assumed.
-3. **Archive.** Every response is written to `data/raw/` before parsing. Re-parsing
+3. **Attendance.** The game log only holds games ESPN has a stat line for, so
+   `sports.core.api.espn.com/v2/.../athletes/{id}/eventlog` is read afterwards to
+   find the games a player was there for and the log skipped — see
+   [Games the game log leaves out](#games-the-game-log-leaves-out).
+4. **Archive.** Every response is written to `data/raw/` before parsing. Re-parsing
    after a bug fix costs no network calls, and the raw payloads stay auditable.
 
 ### Why the JSON API rather than `pd.read_html`
@@ -119,7 +127,7 @@ the matching box score category, scanning those three cannot miss anyone who sco
 
 ```bash
 python -m ffdb schedule --season 2022      # once, so `games` has the events
-python -m ffdb build-season --season 2020-2024
+python -m ffdb build-season --season 2016-2025
 ```
 
 | phase | what it does | cost |
@@ -145,6 +153,91 @@ WITH scorers AS (
 SELECT g.* FROM player_games g
 JOIN scorers s ON s.athlete_id = g.athlete_id AND s.season = g.season
 ```
+
+## Games the game log leaves out
+
+A game log is not a list of the games a player was available for. It is a list of the
+games ESPN has a stat line for. A player who dressed, took snaps and touched nothing
+produces no row, so the season just skips that week — and in `player_games` that is
+indistinguishable from being injured. Both are an absent row.
+
+It matters because the absent rows are zeros, and dropping zeros lifts every per-game
+average. So when a player is missing a game their team played, is it safe to write a
+zero in? Almost always **no**, and `attendance` is the command that works out which
+ones it is safe for:
+
+```bash
+python -m ffdb attendance --season 2016-2025 --dry-run   # classify the gaps, write nothing
+python -m ffdb attendance --season 2016-2025             # fill the ones that are safe
+```
+
+It reads ESPN's core-API **event log**, which lists every event an athlete was on a
+roster for — played or not — with a flag saying which:
+
+```
+sports.core.api.espn.com/v2/.../seasons/{season}/athletes/{id}/eventlog
+    events.items[] -> {event {$ref}, teamId, played, statistics {$ref}}
+```
+
+That splits a gap three ways, and only the first is fillable:
+
+| in the event log | `played` | what it means | what happens |
+|---|---|---|---|
+| yes | `true` | played, recorded nothing | row is recovered |
+| yes | `false` | on the roster, did not play | left absent |
+| no | — | not on the roster that week | left absent |
+
+The third case is the one that makes a naive fill dangerous. Diffing a player's rows
+against their team's schedule finds **33,310 gaps across 2016-2025** — against 60,503
+real rows — and the overwhelming majority are weeks the player was hurt, inactive, on
+IR, or not yet signed. Zero-filling all of them would have grown the table by 55% with
+invented rows, cut the mean of every per-game feature by about a third, and taught a
+model that a third of the league dresses and does nothing every Sunday.
+
+Running it over all ten seasons — 5,461 athlete-seasons, one request each — the split
+came out like this:
+
+| season | played, unlogged | rostered but inactive |
+|---|---|---|
+| 2016 | 9 | 1,733 |
+| 2017 | 10 | 1,691 |
+| 2018 | 11 | 1,848 |
+| 2019 | 13 | 1,801 |
+| 2020 | 24 | 2,085 |
+| **2021** | **146** | 2,860 |
+| 2022 | 0 | 2,058 |
+| 2023 | 0 | 1,813 |
+| 2024 | 0 | 1,899 |
+| 2025 | 4 | 2,126 |
+| total | **217** | 19,914 |
+
+So of 33,310 schedule gaps, **217 were safe to fill and 33,093 were not** — one in 154.
+2022 through 2024 have none at all: ESPN's two endpoints agree with each other
+perfectly there, which is the best evidence that the flag means what it says.
+
+**Nothing here is assumed to be zero, either.** Each fillable game's `statistics` ref
+is fetched and the real line is stored. All 217 came back at exactly 0.00 PPR — which
+is precisely why ESPN's game log dropped them — but had any not, the row would have
+been written with the numbers that actually happened and reported separately, rather
+than flattened into a zero that never occurred.
+
+**What the 217 turn out to be: return specialists, all of them.** 215 of 217 have a
+kick- or punt-return line and nothing else; the other two have a stray non-return stat.
+None are blank. That makes sense once you see the mechanism — a game log carries only
+the offensive vocabulary for that position, so a receiver whose whole afternoon was
+"2 kick returns for 41 yards" produces no row at all, while the event log can still
+prove they were there because a `returning` stat line exists to point at.
+
+That is also the ceiling on the technique: it recovers games that left a trace in
+ESPN's data. A player who touched the ball zero times in every phase leaves none, gets
+`played: false` and no `statistics` ref, and stays missing.
+
+Recovered rows are marked `source = 'eventlog'`, so they can be excluded, counted, or
+compared against the rest at query time. Only athlete-seasons that already have at
+least one game-log row are considered: an athlete-season with none is not a quiet year,
+it is one of the empty game logs described under
+[known upstream limitations](#data-quality-notes), and filling it would manufacture a
+career out of an outage.
 
 ## Querying the data
 
@@ -188,6 +281,11 @@ team names; `v_player_games_vs_defense` attaches the opposing defense to every
 player-game; `v_team_schedule` is every regular-season game from both teams' points
 of view, one row per team per week; `v_team_defense_seasons` is one row per team per
 season of per-game defensive averages.
+
+Every `player_games` row carries a `source`: `gamelog` for the normal path, and
+`eventlog` for a game ESPN's game log skipped that was recovered from the event log
+(see [Games the game log leaves out](#games-the-game-log-leaves-out)). Add
+`WHERE source = 'gamelog'` if you want only ESPN's own rows.
 
 **Stat columns are dynamic.** ESPN publishes a different stat vocabulary per
 position — a QB log has `passingYards` and `QBRating`, a RB log has
@@ -245,8 +343,8 @@ WHERE pg.season = 2024;
 
 ### Season averages
 
-`v_team_defense_seasons` collapses that table to one row per team per season — 192
-rows for 2020-2025, 32 teams each:
+`v_team_defense_seasons` collapses that table to one row per team per season — 320
+rows for 2016-2025, 32 teams each:
 
 ```sql
 SELECT team_abbr, games, points_allowed_pg, yards_allowed_pg, sacks_pg,
@@ -270,12 +368,29 @@ them, and a `0` averages in as a real low where a `NULL` would be skipped:
 
 | stat | how bad | left out because |
 |---|---|---|
-| `redzone_tds_allowed` | `0.0` in all 3,230 rows, every season | a red-zone TD rate built on it reads as a real 0% for all 32 teams |
-| `plays_allowed` | `0` in 446 of 2020's 512 games | averaging the zeros puts 2020 near 8 plays per game; skipping them leaves ~2 games per team backing the number |
+| `redzone_tds_allowed` | `0.0` in all 5,278 rows, every season | a red-zone TD rate built on it reads as a real 0% for all 32 teams |
+| `plays_allowed` | `0` in 446 of 2020's 512 games, and in ~93% of every season before that | averaging the zeros puts 2016-2020 near 5 plays per game; skipping them leaves ~1 game per team backing the number |
 
 Both remain on `team_defense_games` if you want to handle them yourself.
 `redzone_att_allowed_pg` is unaffected and stays — red-zone trips faced are real, it
 is only what happened inside the 20 that is missing.
+
+**Turnovers are a 2021-onward column.** ESPN began publishing
+`miscellaneous.totalGiveaways` / `totalTakeaways` in 2021; before that the keys are
+simply absent, and only 34-66 games a season carry one:
+
+| season | games | with a turnover figure |
+|---|---|---|
+| 2016-2019 | 512 each | 34-40 |
+| 2020 | 512 | 66 |
+| 2021-2025 | 542-544 each | all of them |
+
+They land as `NULL` rather than `0`, which is honest but sets a subtler trap: `AVG()`
+skips nulls, so a season average would silently be the mean of about two games per
+team. `turnovers_forced_pg` and `takeaways_pg` are therefore guarded on every game in
+the season having a value — a real number from 2021 on, `NULL` before it. The
+per-game columns are untouched on `team_defense_games`, and `interceptions` and
+`fumbles_recovered` are populated throughout if you want to build your own.
 
 > The same leakage warning applies here in a subtler form: a full-season average
 > includes the games you are predicting. For a backward-looking feature, build a
@@ -348,18 +463,20 @@ Things that were found the hard way and are handled in code:
   as a real low where a `NULL` would be skipped, so `v_team_defense_seasons` leaves
   both out. They stay on `team_defense_games`. Worth checking any new column for this
   before trusting it — `SUM(col) = 0` over a whole season is the tell.
-- **2021 game logs omit some scoreless appearances.** Holding the player set fixed,
-  the same 417 players show 21.9% zero-point games in 2020, 15.6% in 2021, then 25.6%
-  in 2022 — so it is the season, not who was in it. 2021 carries ~20 fewer player rows
-  per game-week than its neighbours and the shortfall is almost entirely scoreless
-  games, which lifts its mean PPR to 7.99 against 6.7–6.9 either side. Nothing is
-  wrong with the rows that are there; they are simply missing the quiet games. Worth a
-  season indicator in any model trained across it, and a reason not to read 2021 as a
-  genuinely higher-scoring year.
+- **2021 weeks 1-14 hold fewer scoreless games than any comparable window.** They store
+  20.3 player rows per game at a 13.4% zero rate, against 22.3-24.8 and 24-28% in every
+  other season — including 2021 weeks 15-18, which look entirely normal. Whether ESPN is
+  short of rows there or the season genuinely ran that way is unresolved; either way, a
+  per-game average over that window reads about 20% high, so filter it out
+  (`week > 14 OR season <> 2021`) if you are computing rates rather than totals.
 - **An abandoned game has a schedule row and no box score.** 2022 week 17 BUF at CIN
   (event `401437947`) was called off after Damar Hamlin's collapse and never resumed;
-  it is stored `0-0` with a summary containing no players. `build-season` logs it and
-  moves on. No player is lost — both teams played their other 16 games.
+  it is stored `0-0` with a summary containing no players. 2017 week 1 MIA at TB
+  (`400951581`) is the same shape for a different reason — postponed for Hurricane
+  Irma and replayed in week 11 as `400981391`, leaving the week 1 entry behind as a
+  `0-0` husk, which is why 2017's schedule has 257 rows rather than 256. `build-season`
+  and `defense` both log these and move on. No player is lost: every team played its
+  full slate.
 - **Unplayed games carry no box score.** Schedule entries without a final score are
   dropped from `player_games` and `team_defense_games` rather than stored as empty
   rows, so an in-progress season loads cleanly. `games` is the exception — see
@@ -378,11 +495,25 @@ Known upstream limitations, not worked around:
   failing quietly, so gaps like this surface during a bulk load instead of becoming
   silent holes in the training data.
 
+  It is the largest remaining hole, and it is measurable: cross-checking every cached
+  box score against `player_games` finds **1,042 fantasy-position player-games that
+  are in a box score but have no row**, 2016-2025. About a dozen players account for
+  most of it — Kelce (159), Davante Adams (149), Keenan Allen (133), Andy Dalton (101),
+  A.J. Green (80) — all of them unrostered as of the 2025 season. These are real
+  production, not quiet games, so `attendance` deliberately does not touch them; see
+  [Next steps](#next-steps).
+
 ## Next steps
 
-- Assemble the top-200 player list, then `build_players()` it — batch loading,
-  per-player error isolation and the dynamic schema are already in place and
-  tested against QB/RB/WR logs.
+- Recover the 1,042 player-games belonging to athletes whose game log ESPN serves
+  empty. The machinery already exists: `attendance` fetches a single athlete's stat
+  line for a single event from the core API, which is exactly what these need — the
+  only new part is enumerating the candidates from box scores rather than from the
+  event log, and the athletes' stat lines are real production rather than zeros, so
+  they cannot ride along on the same pass.
+- Extend `build-season` back past 2016. The box-score enumeration works as far back
+  as ESPN's coverage does; the constraint is the thinning stat vocabulary in older
+  seasons rather than the loader.
 - Derive modelling features (rolling averages, rest days, opponent strength) from
   `player_games`; the `game_date`/`opponent_id` columns exist for exactly this.
   Opponent strength now has `team_defense_games` behind it — build it as a trailing

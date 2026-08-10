@@ -23,6 +23,15 @@ class ESPNError(RuntimeError):
     pass
 
 
+class ESPNNotFound(ESPNError):
+    """A 4xx: the resource is absent, not temporarily unavailable.
+
+    Kept apart from ESPNError so it can skip the retry loop. Some endpoints
+    404 as a normal answer - an athlete with no stat line for an event - and
+    retrying that four times with backoff costs 14 seconds to learn nothing.
+    """
+
+
 class ESPNClient:
     def __init__(
         self,
@@ -50,7 +59,10 @@ class ESPNClient:
     def _cache_path(self, cache_key: str) -> Path:
         return self.cache_dir / f"{cache_key}.json"
 
-    def _read_cache(self, cache_key: str) -> dict | None:
+    # read_cache/write_cache are public so a caller that assembles one document
+    # out of several responses - a paginated endpoint, say - can archive the
+    # merged result under a single key instead of one file per page.
+    def read_cache(self, cache_key: str) -> dict | None:
         path = self._cache_path(cache_key)
         if not path.exists():
             return None
@@ -60,7 +72,7 @@ class ESPNClient:
             log.warning("Discarding unreadable cache file %s", path)
             return None
 
-    def _write_cache(self, cache_key: str, payload: dict) -> None:
+    def write_cache(self, cache_key: str, payload: dict) -> None:
         path = self._cache_path(cache_key)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload), encoding="utf-8")
@@ -82,7 +94,7 @@ class ESPNClient:
     ) -> dict:
         """GET a JSON document, honouring the on-disk archive when possible."""
         if cache_key and self.use_cache and not force:
-            cached = self._read_cache(cache_key)
+            cached = self.read_cache(cache_key)
             if cached is not None:
                 log.debug("cache hit %s", cache_key)
                 return cached
@@ -94,8 +106,12 @@ class ESPNClient:
                 response = self.session.get(url, params=params, timeout=45)
                 if response.status_code == 429 or response.status_code >= 500:
                     raise ESPNError(f"HTTP {response.status_code} from {response.url}")
+                if 400 <= response.status_code < 500:
+                    raise ESPNNotFound(f"HTTP {response.status_code} from {response.url}")
                 response.raise_for_status()
                 payload = response.json()
+            except ESPNNotFound:
+                raise
             except (requests.RequestException, ESPNError, json.JSONDecodeError) as exc:
                 last_error = exc
                 backoff = min(2 ** attempt, 30)
@@ -105,7 +121,7 @@ class ESPNClient:
                 continue
 
             if cache_key:
-                self._write_cache(cache_key, payload)
+                self.write_cache(cache_key, payload)
             return payload
 
         raise ESPNError(f"Giving up on {url} after {self.max_retries} attempts") from last_error
