@@ -86,6 +86,17 @@ USER_AGENT = None
 REQUEST_DELAY = 0.5
 MAX_RETRIES = 4
 
+# nflverse: preseason roster and depth-chart history, which ESPN does not keep.
+# Published as parquet on GitHub releases and fetched directly rather than
+# through a client library - see ffdb/preseason.py for why this source exists
+# at all. GitHub rejects a request with no User-Agent, so this cannot reuse the
+# `USER_AGENT = None` that ESPN's box scores require.
+NFLVERSE_RELEASE_URL = "https://github.com/nflverse/nflverse-data/releases/download"
+NFLVERSE_USER_AGENT = "fantasy-football-db"
+NFLVERSE_DIR = DATA_DIR / "nflverse"
+# Earliest season with both weekly rosters and weekly depth charts published.
+NFLVERSE_FIRST_SEASON = 2016
+
 # ESPN season type ids, matching their own numbering.
 SEASON_TYPE_PRE = 1
 SEASON_TYPE_REGULAR = 2
@@ -93,5 +104,5 @@ SEASON_TYPE_POST = 3
 
 
 def ensure_dirs() -> None:
-    for d in (DATA_DIR, RAW_DIR, EXPORT_DIR):
+    for d in (DATA_DIR, RAW_DIR, EXPORT_DIR, NFLVERSE_DIR):
         d.mkdir(parents=True, exist_ok=True)

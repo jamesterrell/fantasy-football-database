@@ -1,6 +1,8 @@
 # Raw API archive and generated database - reproducible via `python -m ffdb add`
 data/raw/
 data/exports/
+# Cached nflverse parquet - re-downloadable via `python -m ffdb preseason`
+data/nflverse/
 *.db
 *.db-wal
 *.db-shm

@@ -231,6 +231,67 @@ CREATE TABLE IF NOT EXISTS athlete_seasons (
     PRIMARY KEY (athlete_id, season)
 );
 
+-- Where each player stood at the start of a season: on a roster or not, on
+-- which team, and where on the depth chart. Sourced from nflverse rather than
+-- ESPN, which keeps no history - `athletes.status` is a live snapshot that is
+-- overwritten, and ESPN's depth-chart endpoint ignores the season in its URL
+-- and serves today's chart for every year. See ffdb/preseason.py.
+--
+-- `status` is nflverse's raw code (ACT, DEV, RES, INA, CUT, RET, ...) plus
+-- 'NONE' for a candidate who appeared on no roster at all. That row is written
+-- deliberately: a missing row means "not looked at", which is not the same
+-- claim as "not employed".
+--
+-- The snapshot is regular-season week 1, the earliest the source publishes, so
+-- it sits a few days after most drafts. Harmless for released/retired players,
+-- which are settled in July; `active` also reflects game-day inactives, so
+-- prefer `on_roster` where that difference could matter.
+--
+-- Deliberately no REFERENCES athletes(athlete_id): an NFL roster carries
+-- players this database has never loaded a game log for, and with foreign keys
+-- on those rows would be rejected rather than stored. The join still works for
+-- everyone `athletes` knows about.
+CREATE TABLE IF NOT EXISTS preseason_roster (
+    season         INTEGER NOT NULL,
+    athlete_id     TEXT    NOT NULL,
+    gsis_id        TEXT,
+    full_name      TEXT,
+    position       TEXT,
+    team           TEXT,
+    status         TEXT,
+    status_desc    TEXT,
+    on_roster      INTEGER,
+    active         INTEGER,
+    depth_rank     REAL,
+    depth_position TEXT,
+    snapshot_week  INTEGER,
+    -- Which depth-chart reading this row came from: "week 1" for 2016-2024,
+    -- an ISO date for 2025 on, where nflverse switched to timestamped
+    -- snapshots starting in early August. The two are not interchangeable and
+    -- the newer one is earlier relative to the season.
+    depth_snapshot TEXT,
+    source         TEXT,
+    updated_at     TEXT,
+    PRIMARY KEY (season, athlete_id)
+);
+
+-- Snap share per player-season, from nflverse (PFR upstream), regular season
+-- only. Measures role directly - how much of his offense's snaps he was on the
+-- field for - where box-score volume only measures the result. See ffdb/snaps.py.
+CREATE TABLE IF NOT EXISTS player_snaps (
+    season           INTEGER NOT NULL,
+    athlete_id       TEXT    NOT NULL,
+    team             TEXT,
+    position         TEXT,
+    games_with_snaps INTEGER,
+    offense_snaps    REAL,
+    -- Averaged over games he appeared in, not over the season: the availability
+    -- model owns missed time, and folding it in here would count it twice.
+    offense_pct      REAL,
+    updated_at       TEXT,
+    PRIMARY KEY (season, athlete_id)
+);
+
 CREATE TABLE IF NOT EXISTS sync_log (
     athlete_id TEXT NOT NULL,
     season     INTEGER NOT NULL,
@@ -246,6 +307,8 @@ CREATE INDEX IF NOT EXISTS ix_games_season ON games(season, week);
 CREATE INDEX IF NOT EXISTS ix_team_defense_event ON team_defense_games(event_id);
 CREATE INDEX IF NOT EXISTS ix_team_defense_season ON team_defense_games(season, week);
 CREATE INDEX IF NOT EXISTS ix_team_defense_opponent ON team_defense_games(opponent_id, season);
+CREATE INDEX IF NOT EXISTS ix_preseason_roster_athlete ON preseason_roster(athlete_id, season);
+CREATE INDEX IF NOT EXISTS ix_player_snaps_athlete ON player_snaps(athlete_id, season);
 """
 
 # Kept apart from SCHEMA because _migrate_stat_catalog rebuilds this table on
@@ -283,6 +346,9 @@ MIGRATIONS: dict[str, dict[str, str]] = {
     # A constant DEFAULT is what existing rows read back as, so the rows loaded
     # before this column existed correctly report themselves as game-log rows.
     "player_games": {"is_all_star": "INTEGER DEFAULT 0", "source": "TEXT DEFAULT 'gamelog'"},
+    # Added when nflverse changed the depth-chart format for 2025, which made
+    # "which reading is this" a thing the row has to state rather than imply.
+    "preseason_roster": {"depth_snapshot": "TEXT"},
 }
 
 
