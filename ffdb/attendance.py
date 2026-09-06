@@ -95,6 +95,15 @@ def fetch_eventlog(
     return merged
 
 
+def fetch_season_stats(client: ESPNClient, athlete_id: str, force: bool = False) -> dict:
+    """Career season totals for one athlete. One request covers every season."""
+    return client.get_json(
+        config.ATHLETE_STATS_URL.format(athlete_id=athlete_id),
+        cache_key=f"athlete_stats/{athlete_id}",
+        force=force,
+    )
+
+
 def fetch_event_stats(
     client: ESPNClient, athlete_id: str, event_id: str, ref: str, force: bool = False
 ) -> dict | None:
@@ -132,6 +141,33 @@ def parse_eventlog(payload: dict) -> list[dict]:
             }
         )
     return entries
+
+
+def games_played(payload: dict) -> dict[int, int]:
+    """season -> games played, from the season totals payload.
+
+    Every stat category repeats `gamesPlayed`, and a handful of athletes carry
+    different figures in different categories - a player who both rushed and
+    returned kicks can show the games in which each applied. The largest is the
+    number of games they appeared in, which is what a denominator wants.
+    """
+    per_season: dict[int, int] = {}
+    for category in payload.get("categories") or []:
+        names = category.get("names") or []
+        if "gamesPlayed" not in names:
+            continue
+        index = names.index("gamesPlayed")
+        for entry in category.get("statistics") or []:
+            season = (entry.get("season") or {}).get("year")
+            stats = entry.get("stats") or []
+            if season is None or index >= len(stats):
+                continue
+            try:
+                value = int(str(stats[index]).replace(",", ""))
+            except ValueError:
+                continue
+            per_season[season] = max(per_season.get(season, 0), value)
+    return per_season
 
 
 def parse_event_stats(payload: dict) -> dict[str, float | None]:
@@ -291,6 +327,149 @@ def known_stat_keys(conn: sqlite3.Connection) -> set[str]:
             "SELECT stat_name FROM stat_catalog WHERE table_name = 'player_games'"
         )
     }
+
+
+# ------------------------------------------------- recovery from games played
+
+
+def forced_assignment(missing: int, candidates: list[dict]) -> list[dict] | None:
+    """The games to fill, when the shortfall can only be assigned one way.
+
+    ESPN's season total says how many games a player appeared in, never which.
+    That is enough on its own only when the number of games they were rostered
+    for and have no row for is exactly the number missing - then every one of
+    them must be a game they played, and no choice is being made. With more
+    candidates than missing rows, picking any subset would be inventing which
+    weeks a player was on the field, so None comes back and they stay absent.
+    """
+    if missing <= 0 or len(candidates) != missing:
+        return None
+    return candidates
+
+
+def fill_from_games_played(
+    conn: sqlite3.Connection,
+    client: ESPNClient,
+    seasons: Iterable[int],
+    dry_run: bool = False,
+    force: bool = False,
+) -> dict:
+    """Store ESPN's games-played count, and fill the games it pins down.
+
+    Runs after the event-log pass, because it only has anything to say about
+    games that pass left behind. One request per athlete covers a whole career.
+    """
+    season_list = sorted(set(seasons))
+    games = {
+        event_id: row
+        for event_id, row in _game_index(conn, season_list).items()
+        if row["season_type"] == config.SEASON_TYPE_REGULAR
+    }
+    abbr = _team_abbreviations(conn)
+
+    # Regular season only on both sides: ESPN's games-played excludes playoffs.
+    have: dict[str, dict[int, set[str]]] = {}
+    marks = ", ".join("?" for _ in season_list)
+    for row in conn.execute(
+        f"SELECT athlete_id, season, event_id FROM player_games WHERE season IN ({marks}) "
+        "AND season_type = 2 AND is_all_star = 0",
+        season_list,
+    ):
+        have.setdefault(row["athlete_id"], {}).setdefault(row["season"], set()).add(row["event_id"])
+
+    tally = dict.fromkeys(
+        ("athletes", "no_stats", "seasons_recorded", "short_seasons",
+         "missing_rows", "forced", "ambiguous", "impossible", "filled"), 0
+    )
+    per_season: dict[int, dict[str, int]] = {
+        s: {"missing": 0, "forced": 0, "ambiguous": 0} for s in season_list
+    }
+    season_rows: list[dict] = []
+    filled_rows: list[dict] = []
+
+    log.info("reading season totals for %d athletes", len(have))
+    for i, (athlete_id, by_season) in enumerate(sorted(have.items()), 1):
+        try:
+            payload = fetch_season_stats(client, athlete_id, force=force)
+        except Exception as exc:  # noqa: BLE001 - one bad athlete must not stop the sweep
+            log.error("season totals failed for %s: %s", athlete_id, exc)
+            tally["no_stats"] += 1
+            continue
+        tally["athletes"] += 1
+        counts = games_played(payload)
+
+        for season, events in by_season.items():
+            gp = counts.get(season)
+            if gp is None:
+                continue
+            season_rows.append(
+                {"athlete_id": athlete_id, "season": season, "games_played": gp}
+            )
+            tally["seasons_recorded"] += 1
+
+            missing = gp - len(events)
+            if missing <= 0:
+                continue
+            tally["short_seasons"] += 1
+            tally["missing_rows"] += missing
+            per_season[season]["missing"] += missing
+
+            try:
+                entries = parse_eventlog(fetch_eventlog(client, athlete_id, season, force=force))
+            except Exception as exc:  # noqa: BLE001
+                log.error("event log failed for %s %s: %s", athlete_id, season, exc)
+                continue
+            candidates = [
+                e for e in entries if e["event_id"] in games and e["event_id"] not in events
+            ]
+            assigned = forced_assignment(missing, candidates)
+            if assigned is None:
+                bucket = "impossible" if len(candidates) < missing else "ambiguous"
+                tally[bucket] += missing
+                if bucket == "ambiguous":
+                    per_season[season]["ambiguous"] += missing
+                continue
+
+            tally["forced"] += missing
+            per_season[season]["forced"] += missing
+            if dry_run:
+                continue
+            for entry in assigned:
+                try:
+                    row = build_row(
+                        athlete_id, games[entry["event_id"]], entry["team_id"], {}, (), abbr
+                    )
+                except ValueError as exc:
+                    log.error("skipping %s: %s", athlete_id, exc)
+                    continue
+                # No stat line exists for these - that is why the game log has no
+                # row. The zero is the point: ESPN counts the appearance, and a
+                # player who had scored would be in the box score and logged.
+                row["source"] = "inferred"
+                row.update({"fp_standard": 0.0, "fp_half_ppr": 0.0, "fp_ppr": 0.0})
+                filled_rows.append(row)
+                tally["filled"] += 1
+
+        if len(season_rows) >= 500 and not dry_run:
+            db.upsert_athlete_seasons(conn, season_rows)
+            season_rows.clear()
+        if filled_rows and len(filled_rows) >= 200 and not dry_run:
+            db.upsert_player_games(conn, filled_rows)
+            filled_rows.clear()
+        if i % 250 == 0:
+            log.info(
+                "[%d/%d] athletes read; %d missing rows, %d of them forced",
+                i, len(have), tally["missing_rows"], tally["forced"],
+            )
+
+    if not dry_run:
+        if season_rows:
+            db.upsert_athlete_seasons(conn, season_rows)
+        if filled_rows:
+            db.upsert_player_games(conn, filled_rows)
+        db.rebuild_views(conn)
+
+    return {**tally, "per_season": per_season, "seasons": season_list}
 
 
 # ------------------------------------------------------------------ the sweep

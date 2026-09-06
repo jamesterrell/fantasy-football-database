@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from . import athletes as athletes_mod
-from . import attendance, config, db, pipeline, ranking, scoring, seasonpool
+from . import attendance, config, db, pipeline, preseason, ranking, scoring, seasonpool, snaps
 from .espn import ESPNClient
 
 
@@ -221,6 +221,45 @@ def cmd_attendance(args: argparse.Namespace) -> int:
             "with their real numbers",
             file=sys.stderr,
         )
+
+    if args.skip_games_played:
+        conn.close()
+        return 0
+
+    gp = attendance.fill_from_games_played(
+        conn, _client(args), seasons=_season_range(args.season),
+        dry_run=args.dry_run, force=args.force,
+    )
+    print(
+        f"\nseason totals read for {gp['athletes']} athletes"
+        + (f" ({gp['no_stats']} unavailable)" if gp["no_stats"] else "")
+        + f"; games-played recorded for {gp['seasons_recorded']} athlete-seasons"
+    )
+    header = f"{'SEASON':<8}{'ROWS SHORT OF GP':>18}{'FORCED':>8}{'AMBIGUOUS':>11}"
+    print("\n" + header)
+    print("-" * len(header))
+    for season, counts in sorted(gp["per_season"].items()):
+        print(
+            f"{season:<8}{counts['missing']:>18}{counts['forced']:>8}{counts['ambiguous']:>11}"
+        )
+    print(
+        f"\n{gp['missing_rows']} rows short of ESPN's games-played across "
+        f"{gp['short_seasons']} athlete-seasons"
+    )
+    print(
+        f"{verb} {gp['filled']} of them - the ones with only one possible assignment; "
+        f"{gp['ambiguous']} could be any of several weeks and were left absent"
+    )
+    if gp["impossible"]:
+        print(
+            f"{gp['impossible']} had fewer candidate games than games played, which should "
+            "not happen - check them",
+            file=sys.stderr,
+        )
+    print(
+        "the ambiguous ones are still counted: v_player_seasons.games_played holds ESPN's "
+        "figure, so fp_ppr_per_game_played is right even where the rows are not there"
+    )
     conn.close()
     return 0
 
@@ -338,6 +377,59 @@ def cmd_defense(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_preseason(args: argparse.Namespace) -> int:
+    conn = db.connect(args.db)
+    db.init_db(conn)
+
+    last = args.last if args.last is not None else args.first
+    result = preseason.build(conn, range(args.first, last + 1), force=args.force)
+    if not result["seasons"]:
+        print("no seasons loaded")
+        return 1
+
+    print(f"{result['rows']:,} rows across {len(result['seasons'])} seasons\n")
+    print(f"{'season':>6}  {'rows':>6}  {'rostered':>8}  {'unrostered':>10}  "
+          f"{'depth':>6}  week")
+    for season, stats in sorted(result["seasons"].items()):
+        print(f"{season:>6}  {stats['rows']:>6}  {stats['rostered']:>8}  "
+              f"{stats['unrostered']:>10}  {stats['with_depth']:>6}  "
+              f"{stats['snapshot_week']}")
+
+    # The join is the whole point of the table, so report it rather than assume
+    # it: a silent id mismatch would show up here as a low match rate.
+    rows = conn.execute(
+        """
+        SELECT pr.season,
+               COUNT(*)                                  AS candidates,
+               SUM(pr.status = 'NONE')                   AS unrostered,
+               SUM(pr.depth_rank IS NOT NULL)            AS with_depth
+        FROM preseason_roster pr
+        JOIN athletes a ON a.athlete_id = pr.athlete_id
+        WHERE a.position_abbr IN ('QB','RB','WR','TE')
+        GROUP BY pr.season ORDER BY pr.season
+        """
+    ).fetchall()
+    print(f"\njoined to athletes, fantasy positions only:")
+    for row in rows:
+        print(f"  {row['season']}: {row['candidates']:4d} players, "
+              f"{row['unrostered']:3d} unrostered, {row['with_depth']:4d} with a depth rank")
+    return 0
+
+
+def cmd_snaps(args: argparse.Namespace) -> int:
+    conn = db.connect(args.db)
+    db.init_db(conn)
+    last = args.last if args.last is not None else args.first
+    result = snaps.build(conn, range(args.first, last + 1), force=args.force)
+    if not result["seasons"]:
+        print("no seasons loaded")
+        return 1
+    print(f"{result['rows']:,} player-seasons across {len(result['seasons'])} seasons")
+    for season, st in sorted(result["seasons"].items()):
+        print(f"  {season}: {st['rows']:5d} players, mean snap share {st['mean_pct']:.3f}")
+    return 0
+
+
 def cmd_index(args: argparse.Namespace) -> int:
     client = _client(args)
     index = athletes_mod.fetch_athlete_index(client, force=args.force)
@@ -416,6 +508,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true",
         help="classify the gaps and report, without fetching stat lines or writing",
     )
+    p_att.add_argument(
+        "--skip-games-played", action="store_true",
+        help="event-log pass only; skip the season games-played comparison",
+    )
     p_att.add_argument("--force", action="store_true", help="ignore the raw JSON archive")
     p_att.set_defaults(func=cmd_attendance)
 
@@ -446,6 +542,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_def.add_argument("--postseason", action="store_true", help="include playoff games")
     p_def.add_argument("--force", action="store_true", help="re-fetch instead of using the archive")
     p_def.set_defaults(func=cmd_defense)
+
+    p_pre = sub.add_parser(
+        "preseason",
+        help="load preseason roster + depth chart history (nflverse, not ESPN)",
+    )
+    p_pre.add_argument("--first", type=int, default=config.NFLVERSE_FIRST_SEASON)
+    p_pre.add_argument("--last", type=int, help="defaults to --first (single season)")
+    p_pre.add_argument("--force", action="store_true", help="re-download cached parquet")
+    p_pre.set_defaults(func=cmd_preseason)
+
+    p_snaps = sub.add_parser("snaps", help="load snap share per player-season (nflverse)")
+    p_snaps.add_argument("--first", type=int, default=2016)
+    p_snaps.add_argument("--last", type=int)
+    p_snaps.add_argument("--force", action="store_true")
+    p_snaps.set_defaults(func=cmd_snaps)
 
     p_index = sub.add_parser("index", help="refresh/search ESPN's athlete index")
     p_index.add_argument("--search", help="look up ids for a name")

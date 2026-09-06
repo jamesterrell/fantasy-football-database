@@ -3,7 +3,7 @@
 Game-level career data for NFL fantasy-relevant players, built from ESPN's public
 APIs into a local SQLite database, for use as a modelling dataset.
 
-Currently holds **64,180 player-games across 1,657 players and 3,215 distinct NFL
+Currently holds **64,563 player-games across 1,657 players and 3,215 distinct NFL
 games, spanning 2005-2025** — every fantasy-position player who appeared in a game
 from 2016 on, plus the earlier careers of the top 200 fantasy scorers of 2025.
 
@@ -40,7 +40,7 @@ python -m ffdb schedule --season 2026             # a season's matchups, upcomin
 python -m ffdb add "Josh Allen" "Ja'Marr Chase"   # batch; one failure won't abort the run
 python -m ffdb add 4242335 --season 2025 --force  # by id, one season, bypass the cache
 python -m ffdb index --search "Justin Tucker"     # look up ESPN athlete ids
-python -m unittest discover -s tests              # 105 tests, no network needed
+python -m unittest discover -s tests              # 117 tests, no network needed
 ```
 
 `--force` re-fetches from ESPN instead of reading the local archive. Use it for the
@@ -232,6 +232,31 @@ That is also the ceiling on the technique: it recovers games that left a trace i
 ESPN's data. A player who touched the ball zero times in every phase leaves none, gets
 `played: false` and no `statistics` ref, and stays missing.
 
+### Games played, as a second opinion
+
+ESPN also publishes season totals per athlete, including games played, from a pipeline
+independent of the game log — and it disagrees. `attendance` reads it in a second pass
+(one request per athlete, whole career) and stores it in `athlete_seasons`.
+
+| seasons | rows short of games played |
+|---|---|
+| 2022-2025 | 0 |
+| 2016-2020 | 48-96 each |
+| 2021 | 739 |
+
+The zeros are what make the rest trustworthy: where the game log is complete the two
+sources agree exactly, so a discrepancy is a real missing row rather than two ways of
+counting. **383 of the 1,083 were filled** — the ones where a player's rostered-but-
+unlogged games number exactly what they are short, leaving one possible assignment and
+no choice to make. They carry `source = 'inferred'` and are the only zeros in the
+database written without a stat line behind them.
+
+The other 690 are not filled. Games played says *how many*, never *which*, and picking
+weeks out of a larger candidate set would invent where a player was on the field. They
+are still accounted for: `v_player_seasons` exposes `games_played` beside the row count
+and `fp_ppr_per_game_played` divides by it, so per-game rates are right even where the
+row is missing.
+
 Recovered rows are marked `source = 'eventlog'`, so they can be excluded, counted, or
 compared against the rest at query time. Only athlete-seasons that already have at
 least one game-log row are considered: an athlete-season with none is not a quiet year,
@@ -271,6 +296,7 @@ Regular season is `season_type = 2`, postseason is `3`.
 | `player_games` | **the modelling table** - one row per player per game |
 | `team_defense_games` | one row per team per game: what that defense did and gave up |
 | `rankings` | derived top-N by season and scoring format, with position rank |
+| `athlete_seasons` | ESPN's own games-played per athlete-season, the honest denominator |
 | `stat_catalog` | every stat key seen, which table it lives on, and its column |
 | `sync_log` | what was loaded when, per athlete-season |
 
@@ -463,12 +489,16 @@ Things that were found the hard way and are handled in code:
   as a real low where a `NULL` would be skipped, so `v_team_defense_seasons` leaves
   both out. They stay on `team_defense_games`. Worth checking any new column for this
   before trusting it — `SUM(col) = 0` over a whole season is the tell.
-- **2021 weeks 1-14 hold fewer scoreless games than any comparable window.** They store
-  20.3 player rows per game at a 13.4% zero rate, against 22.3-24.8 and 24-28% in every
-  other season — including 2021 weeks 15-18, which look entirely normal. Whether ESPN is
-  short of rows there or the season genuinely ran that way is unresolved; either way, a
-  per-game average over that window reads about 20% high, so filter it out
-  (`week > 14 OR season <> 2021`) if you are computing rates rather than totals.
+- **2021 is short of rows, and `games_played` is the fix.** ESPN's season games-played
+  totals match the stored row count exactly in 2022-2025, run 48-96 ahead in 2016-2020,
+  and run 739 ahead in 2021. 383 of those were recoverable and are filled; the remaining
+  690 are games ESPN counts but does not place in a particular week. Divide by
+  `v_player_seasons.games_played` rather than by rows — `fp_ppr_per_game_played` does
+  exactly that — and per-game rates come out right even where the row is absent.
+- **One 2016 game has a box score but no game logs.** Event `400874729` (week 13, IND
+  41-10 NYJ) lists players in every box-score category, yet no player on either side has
+  a game-log row for it, so `player_games` holds nothing for that game. It is why nine
+  2016 Colts and Jets sit one row below their games-played count.
 - **An abandoned game has a schedule row and no box score.** 2022 week 17 BUF at CIN
   (event `401437947`) was called off after Damar Hamlin's collapse and never resumed;
   it is stored `0-0` with a summary containing no players. 2017 week 1 MIA at TB
